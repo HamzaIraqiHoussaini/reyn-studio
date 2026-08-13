@@ -180,6 +180,14 @@ bodies, duplicate-instance handling, and component lineage. Internal flow also
 requires stable face-region IDs and a reimport diff for preserved, changed,
 added, removed, and ambiguous regions. Do not infer these from triangle order.
 
+**Landed (protocol / host, no OCCT yet):** bridge `list_occurrences` +
+`occurrence_transform_4x4` / per-triangle `bridge_face_id` fields
+(`docs/occt_bridge_protocol.v1.json`, stub in `src/cad_bridge.rs`); remap
+classifier and fail-closed helpers in `src/cad_identity.rs`; optional
+`identity_kind` / `stable_face_id` on `NamedRegionAssignment`. Heuristic
+`component-*` candidates remain draft-only and never count as preserved across
+reimport.
+
 Release criterion: an edited assembly cannot silently remap a boundary
 assignment or analyze an untransformed part definition.
 

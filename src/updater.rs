@@ -468,7 +468,9 @@ pub fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
     let status = std::process::Command::new("explorer")
         .arg(format!("/select,{}", path.display()))
         .status();
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "linux")]
+    let status = reveal_in_linux_file_manager(path);
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     let status = Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "unsupported platform",
@@ -479,6 +481,28 @@ pub fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
         Ok(status) => Err(format!("File manager exited with status {status}.")),
         Err(error) => Err(format!("Could not reveal the update package: {error}")),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn reveal_in_linux_file_manager(path: &Path) -> std::io::Result<std::process::ExitStatus> {
+    let absolute = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let uri = format!("file://{}", absolute.display());
+    let dbus = std::process::Command::new("dbus-send")
+        .args([
+            "--session",
+            "--dest=org.freedesktop.FileManager1",
+            "--type=method_call",
+            "/org/freedesktop/FileManager1",
+            "org.freedesktop.FileManager1.ShowItems",
+            &format!("array:string:{uri}"),
+            "string:",
+        ])
+        .status();
+    if matches!(&dbus, Ok(status) if status.success()) {
+        return dbus;
+    }
+    let parent = absolute.parent().unwrap_or(absolute.as_path());
+    std::process::Command::new("xdg-open").arg(parent).status()
 }
 
 fn fetch_signed_feed(

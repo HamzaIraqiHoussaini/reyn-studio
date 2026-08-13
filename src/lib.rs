@@ -8,3 +8,4 @@
 #![allow(dead_code)]
 
 pub mod cad_bridge;
+pub mod cad_identity;

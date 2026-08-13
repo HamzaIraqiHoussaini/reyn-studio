@@ -1,0 +1,17 @@
+#!/bin/sh
+# Reyn Studio AppImage entrypoint. APPDIR is set by the AppImage runtime.
+set -eu
+
+SELF=$(readlink -f "$0" 2>/dev/null || python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$0")
+APPDIR=${APPDIR:-$(dirname "$SELF")}
+cd "$APPDIR"
+
+# Prefer the bundled factory runtime when present.
+if [ -x "$APPDIR/ReynPython/bin/python3.14" ]; then
+  export REYN_PYTHON="${REYN_PYTHON:-$APPDIR/ReynPython/bin/python3.14}"
+fi
+
+# Vulkan ICD packages remain a host requirement for the Ubuntu preview.
+# Documented in docs/LINUX_RELEASE.md (mesa-vulkan-drivers).
+
+exec "$APPDIR/reyn-studio" "$@"

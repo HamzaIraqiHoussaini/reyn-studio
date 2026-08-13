@@ -315,6 +315,18 @@ impl ProjectLifecycle {
         Ok(insert)
     }
 
+    pub fn add_digested_content(
+        &mut self,
+        digested: crate::project::DigestedBytes,
+        media_type: impl Into<String>,
+    ) -> ContentInsert {
+        let insert = self.document.add_digested_content(digested, media_type);
+        if !insert.deduplicated {
+            self.dirty = true;
+        }
+        insert
+    }
+
     pub fn relink_content(
         &mut self,
         expected_digest: &str,

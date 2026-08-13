@@ -10,6 +10,10 @@
       "required": ["schema", "op", "request_id"],
       "op": "hello"
     },
+    "list_occurrences": {
+      "required": ["schema", "op", "request_id", "path"],
+      "op": "list_occurrences"
+    },
     "tessellate_step": {
       "required": [
         "schema",
@@ -32,6 +36,17 @@
     "hello_ok": {
       "required": ["schema", "ok", "op", "request_id", "bridge_version", "occt_version"]
     },
+    "occurrences_ok": {
+      "required": [
+        "schema",
+        "ok",
+        "op",
+        "request_id",
+        "assembly",
+        "occurrences"
+      ],
+      "occurrence_fields": ["path", "name", "transform_4x4"]
+    },
     "mesh_ok": {
       "required": [
         "schema",
@@ -45,6 +60,12 @@
         "indices_u32le_b64",
         "tessellation_param_sha256",
         "warnings"
+      ],
+      "optional": [
+        "face_identity_kind",
+        "triangle_face_ids_u32le_b64",
+        "occurrence_path",
+        "occurrence_transform_4x4"
       ]
     },
     "error": {
@@ -53,6 +74,8 @@
       "codes": [
         "unsupported_assembly",
         "occurrence_required",
+        "occurrence_not_found",
+        "ambiguous_face_identity",
         "timeout",
         "memory_limit",
         "malformed_step",
@@ -64,9 +87,11 @@
   },
   "fail_closed": [
     "assemblies without explicit occurrence_path",
+    "unknown occurrence_path",
     "bridge panic or non-zero exit",
     "payload over max_*_bytes",
-    "unknown op"
+    "unknown op",
+    "silent remap of boundary assignments without evidence-safe face identity"
   ],
   "licensing": {
     "studio": "Apache-2.0 / MIT Rust host; never statically links OCCT",

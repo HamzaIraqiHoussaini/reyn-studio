@@ -85,7 +85,7 @@ class MacOSPackagingTests(unittest.TestCase):
     def test_bundle_identity_and_version_are_canonical_cargo_metadata(self):
         self.assertEqual(self.config.bundle_identifier, "com.reyn.studio")
         self.assertEqual(self.config.display_name, "Reyn Studio")
-        self.assertEqual(self.config.version, "0.3.0")
+        self.assertEqual(self.config.version, "0.4.0")
         self.assertEqual(self.config.minimum_system_version, "11.0")
 
     def test_plist_declares_types_without_claiming_broken_finder_open(self):

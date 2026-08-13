@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Reyn Studio
+Comment=Reyn Studio Linux preview (pending verification)
+Exec=reyn-studio
+Icon=ReynStudio
+Terminal=false
+Categories=Science;Education;
+StartupWMClass=reyn-studio
+Keywords=CFD;fluid;flow;simulation;
+X-AppImage-Version=preview

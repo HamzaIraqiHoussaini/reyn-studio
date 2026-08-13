@@ -1,0 +1,184 @@
+name: Linux
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  linux-x86_64:
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      SOURCE_DATE_EPOCH: "315532800"
+      REYN_RESEARCH_SOURCE_DIR: ${{ github.workspace }}/reyn-monorepo/reyn-research
+      REYN_ACCESS_REQUIRED: "1"
+      REYN_ACCESS_ENDPOINT: https://reynflow.com/api/yc-access/v1/session
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Check out research runtime source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: videochataiai/reyn
+          ref: 3515cde4d0f5678437ad6ee6116774f1cd6a3c16
+          path: reyn-monorepo
+          ssh-key: ${{ secrets.REYN_RESEARCH_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Install system packages
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libssl-dev \
+            libgtk-3-dev libxkbcommon-x11-0 libxkbcommon-dev \
+            libwayland-dev libvulkan-dev mesa-vulkan-drivers \
+            libsecret-1-dev dpkg-dev xz-utils curl \
+            libasound2-dev
+
+      - name: Install pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          pins=$(python3 -c 'import json; print(json.load(open("packaging/linux/release-pins.json"))["rust_toolchain"])')
+          target=$(python3 -c 'import json; print(json.load(open("packaging/linux/release-pins.json"))["target"])')
+          rustup toolchain install "$pins" --profile minimal --component rustfmt --target "$target"
+          rustup default "$pins"
+
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+
+      - name: Check Rust formatting
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+
+      - name: Run Rust tests and checks
+        run: |
+          set -euo pipefail
+          uv sync --project "$REYN_RESEARCH_SOURCE_DIR" --frozen
+          test_python="$REYN_RESEARCH_SOURCE_DIR/.venv/bin/python"
+          uv pip install --python "$test_python" \
+            --require-hashes \
+            --index-url https://download.pytorch.org/whl/cpu \
+            --extra-index-url https://pypi.org/simple \
+            --index-strategy unsafe-best-match \
+            --requirements packaging/linux/python-runtime.lock
+          export REYN_PYTHON="$test_python"
+          cargo test --locked --all-targets
+          cargo check --locked --target x86_64-unknown-linux-gnu
+          cargo build --locked --release --target x86_64-unknown-linux-gnu
+
+      - name: Run Linux packaging tests
+        run: |
+          set -euo pipefail
+          python3 -m unittest tests.test_linux_packaging -v
+
+      - name: Assemble pinned CPU runtime
+        run: |
+          set -euo pipefail
+          python_version=$(python3 -c 'import json; print(json.load(open("packaging/linux/release-pins.json"))["python"])')
+          uv python install "$python_version"
+          python_bin=$(uv python find "$python_version")
+          source_root=$(cd "$(dirname "$python_bin")/.." && pwd)
+          runtime="${RUNNER_TEMP}/ReynPython"
+          rm -rf "$runtime"
+          # Dereference symlinks so the packager's symlink-rejecting safe tree copy succeeds.
+          mkdir -p "$runtime"
+          tar -C "$source_root" -cf - . | tar -C "$runtime" -xf -
+          # Materialize any remaining relative links as regular files.
+          find "$runtime" -type l -print0 | while IFS= read -r -d '' link; do
+            target=$(readlink -f "$link")
+            rm -f "$link"
+            cp -a "$target" "$link"
+          done
+          if [[ ! -x "$runtime/bin/python3.14" ]]; then
+            echo "bundled runtime missing bin/python3.14" >&2
+            ls -la "$runtime/bin" >&2
+            exit 1
+          fi
+          uv pip install --python "$runtime/bin/python3.14" \
+            --system \
+            --break-system-packages \
+            --require-hashes \
+            --index-url https://download.pytorch.org/whl/cpu \
+            --extra-index-url https://pypi.org/simple \
+            --index-strategy unsafe-best-match \
+            --requirements packaging/linux/python-runtime.lock
+          uv pip uninstall --python "$runtime/bin/python3.14" \
+            --system \
+            --break-system-packages \
+            pip || true
+          echo "REYN_LINUX_RUNTIME_DIR=$runtime" >> "$GITHUB_ENV"
+
+      - name: Install appimagetool
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "${RUNNER_TEMP}/appimagetool" \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x "${RUNNER_TEMP}/appimagetool"
+          echo "REYN_APPIMAGETOOL=${RUNNER_TEMP}/appimagetool" >> "$GITHUB_ENV"
+
+      - name: Build and validate portable / AppImage / deb
+        run: |
+          set -euo pipefail
+          python3 scripts/package_linux.py \
+            --runtime-dir "$REYN_LINUX_RUNTIME_DIR" \
+            --research-source-dir "$REYN_RESEARCH_SOURCE_DIR" \
+            --binary target/x86_64-unknown-linux-gnu/release/reyn-studio \
+            --appimagetool "$REYN_APPIMAGETOOL" \
+            --runtime-smoke
+          stage=$(find dist/linux -maxdepth 1 -type d -name 'Reyn-Studio-*-linux-x86_64' | head -n 1)
+          test -n "$stage"
+          python3 scripts/validate_linux_package.py "$stage" --runtime-smoke
+          echo "REYN_LINUX_STAGE=$stage" >> "$GITHUB_ENV"
+
+      - name: Engine readiness smoke
+        run: |
+          set -euo pipefail
+          python3 scripts/linux_engine_smoke.py "$REYN_LINUX_STAGE"
+
+      - name: Gated launch cleanup smoke
+        run: |
+          set -euo pipefail
+          # Headless CI may lack a display; xvfb covers the access-gate smoke.
+          sudo apt-get install -y --no-install-recommends xvfb
+          exe="$REYN_LINUX_STAGE/reyn-studio"
+          log="${RUNNER_TEMP}/reyn-studio-linux-launch.log"
+          xvfb-run -a "$exe" >"$log" 2>&1 &
+          pid=$!
+          deadline=$((SECONDS + 30))
+          while (( SECONDS < deadline )) && kill -0 "$pid" 2>/dev/null; do
+            if pgrep -P "$pid" -f 'reyn_engine.py' >/dev/null; then
+              kill "$pid" 2>/dev/null || true
+              wait "$pid" 2>/dev/null || true
+              echo "YC-gated Reyn Studio started its engine before authentication." >&2
+              exit 1
+            fi
+            sleep 0.5
+          done
+          if ! kill -0 "$pid" 2>/dev/null; then
+            echo "Reyn Studio exited before the launch smoke window:" >&2
+            cat "$log" >&2 || true
+            exit 1
+          fi
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+          sleep 2
+          if pgrep -f 'reyn_engine.py' >/dev/null; then
+            echo "Bundled Python engine remained after runner-controlled termination." >&2
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: reyn-studio-linux-x86_64-unverified
+          path: |
+            dist/linux/*.AppImage
+            dist/linux/*.tar.xz
+            dist/linux/*.deb
+            dist/linux/SHA256SUMS
+          if-no-files-found: error

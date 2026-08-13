@@ -37,10 +37,15 @@ Wire contract: [`docs/occt_bridge_protocol.v1.json`](occt_bridge_protocol.v1.jso
    - Frozen contract: `docs/occt_bridge_protocol.v1.json`
    - Coverage: hello, fixture `tessellate_step`, assembly-without-occurrence fail-closed, cancel during `__slow__`, host timeout kill, oversize length-prefix fail-closed (`tests/cad_bridge_ipc.rs` + unit tests).
    - Studio STEP import still uses in-process Truck; the bridge is not on the import path yet.
-2. **Qualification corpus expansion (Truck stays default).** Add SolidWorks / NX / Fusion / Onshape single-part fixtures per `STEP_IMPORT_REVIEW.md` §1. Record when Truck tessellation identity or open-shell diagnostics fail — that evidence gates slice 3.
-3. **OCCT tessellate backend behind the same protocol.** Dynamic link only inside the bridge process; Studio still speaks JSON. Assemblies remain opt-in via `occurrence_path`.
-4. **Wire Studio import fallback (optional before/with 3).** Host spawns `reyn-cad-bridge` only when Truck hits a recorded corpus ceiling; keep Truck as default.
-5. **Packaging.** Separate bridge artifact + LGPL notices; never merge OCCT into the Studio Mach-O / PE. Notarization/Authenticode treat the bridge as its own signed nested binary.
+2. **Occurrence listing + face-identity contract (no OCCT). — DONE (slice 1.5)**
+   - `list_occurrences` stub op with assembly/part transforms.
+   - `mesh_ok` optional `face_identity_kind`, per-triangle face ids, and `occurrence_transform_4x4`.
+   - Host remap library: `src/cad_identity.rs` (heuristic ids never preserve; ambiguous/removed assigned regions fail closed).
+   - `NamedRegionAssignment` persists optional `identity_kind` / `stable_face_id` (legacy reopen defaults).
+3. **Qualification corpus expansion (Truck stays default).** Add SolidWorks / NX / Fusion / Onshape single-part fixtures per `STEP_IMPORT_REVIEW.md` §1. Record when Truck tessellation identity or open-shell diagnostics fail — that evidence gates slice 3.
+4. **OCCT tessellate backend behind the same protocol.** Dynamic link only inside the bridge process; Studio still speaks JSON. Assemblies remain opt-in via `occurrence_path` chosen from `list_occurrences`.
+5. **Wire Studio import fallback (optional before/with 4).** Host spawns `reyn-cad-bridge` only when Truck hits a recorded corpus ceiling; keep Truck as default.
+6. **Packaging.** Separate bridge artifact + LGPL notices; never merge OCCT into the Studio Mach-O / PE. Notarization/Authenticode treat the bridge as its own signed nested binary.
 
 ## Non-goals
 

@@ -393,6 +393,39 @@ pub struct ContentInsert {
     pub deduplicated: bool,
 }
 
+/// Bytes paired with the SHA-256 computed from those same bytes.
+///
+/// Construct only via [`DigestedBytes::new`] so project insertion can trust the
+/// digest without hashing the buffer a second time on the UI thread.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DigestedBytes {
+    bytes: Vec<u8>,
+    digest: String,
+}
+
+impl DigestedBytes {
+    pub fn new(bytes: Vec<u8>) -> Self {
+        let digest = sha256_hex(&bytes);
+        Self { bytes, digest }
+    }
+
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
 #[derive(Clone, Debug)]
 struct BundledContent {
     media_type: String,
@@ -672,9 +705,32 @@ impl ProjectDocument {
     }
 
     pub fn add_content(&mut self, bytes: Vec<u8>, media_type: impl Into<String>) -> ContentInsert {
-        let digest = sha256_hex(&bytes);
-        self.add_content_with_digest(bytes, media_type, &digest)
-            .expect("digest was computed from these bytes")
+        self.add_digested_content(DigestedBytes::new(bytes), media_type)
+    }
+
+    /// Insert bytes whose SHA-256 was already computed by [`DigestedBytes::new`].
+    /// Skips a second hash of the same immutable buffer on the hot path.
+    pub fn add_digested_content(
+        &mut self,
+        digested: DigestedBytes,
+        media_type: impl Into<String>,
+    ) -> ContentInsert {
+        let digest = digested.digest().to_owned();
+        let deduplicated = self.content.contains_key(&digest);
+        self.content.entry(digest.clone()).or_insert_with(|| BundledContent {
+            media_type: media_type.into(),
+            bytes: digested.into_bytes(),
+        });
+        self.invalid_content
+            .retain(|wire| !wire.content_sha256.eq_ignore_ascii_case(&digest));
+        self.load_diagnostics.retain(|diagnostic| {
+            diagnostic.content_sha256.as_deref() != Some(digest.as_str())
+                || diagnostic.kind == ContentDiagnosticKind::Duplicate
+        });
+        ContentInsert {
+            content_sha256: digest,
+            deduplicated,
+        }
     }
 
     pub fn add_content_with_digest(
@@ -685,30 +741,14 @@ impl ProjectDocument {
     ) -> Result<ContentInsert, ProjectError> {
         require_sha256("bundled content", expected_digest)?;
         let expected_digest = expected_digest.to_ascii_lowercase();
-        let actual = sha256_hex(&bytes);
-        if actual != expected_digest {
+        let digested = DigestedBytes::new(bytes);
+        if digested.digest() != expected_digest {
             return Err(ProjectError::ContentHashMismatch {
                 expected: expected_digest,
-                actual,
+                actual: digested.digest().to_owned(),
             });
         }
-        let deduplicated = self.content.contains_key(&expected_digest);
-        self.content
-            .entry(expected_digest.clone())
-            .or_insert_with(|| BundledContent {
-                media_type: media_type.into(),
-                bytes,
-            });
-        self.invalid_content
-            .retain(|wire| !wire.content_sha256.eq_ignore_ascii_case(&expected_digest));
-        self.load_diagnostics.retain(|diagnostic| {
-            diagnostic.content_sha256.as_deref() != Some(expected_digest.as_str())
-                || diagnostic.kind == ContentDiagnosticKind::Duplicate
-        });
-        Ok(ContentInsert {
-            content_sha256: expected_digest,
-            deduplicated,
-        })
+        Ok(self.add_digested_content(digested, media_type))
     }
 
     pub fn relink_content(

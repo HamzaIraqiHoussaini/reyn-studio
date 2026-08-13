@@ -72,6 +72,8 @@ pub struct GeometryImport {
     pub tessellation_tolerance_source_units: Option<f64>,
     pub vertex_weld_relative_tolerance: Option<f64>,
     pub source_shells: usize,
+    /// STEP pick-one shell entity id. None for STL/3MF and single-shell STEP.
+    pub selected_shell_entity_id: Option<u64>,
     pub warnings: Vec<String>,
 }
 
@@ -98,6 +100,7 @@ impl From<GeometryParseError> for String {
 /// Assemblies are rejected by `cad_step` until occurrence transforms and stable
 /// region identity can be preserved in the evidence contract. Multi-shell STEP
 /// files without an assembly graph require an explicit shell selection.
+#[allow(dead_code)] // binary crate; Studio import always goes through selecting
 pub fn parse_geometry(source_name: &str, bytes: &[u8]) -> Result<GeometryImport, String> {
     parse_geometry_selecting(source_name, bytes, None).map_err(Into::into)
 }
@@ -128,6 +131,7 @@ pub fn parse_geometry_selecting(
                 tessellation_tolerance_source_units: None,
                 vertex_weld_relative_tolerance: None,
                 source_shells: 1,
+                selected_shell_entity_id: None,
                 warnings: Vec::new(),
             })
         }
@@ -153,6 +157,7 @@ pub fn parse_geometry_selecting(
                 ),
                 vertex_weld_relative_tolerance: Some(imported.vertex_weld_relative_tolerance),
                 source_shells: imported.shell_count,
+                selected_shell_entity_id: imported.selected_shell_entity_id,
                 warnings: imported.warnings,
             })
         }
@@ -172,6 +177,7 @@ pub fn parse_geometry_selecting(
                 tessellation_tolerance_source_units: None,
                 vertex_weld_relative_tolerance: None,
                 source_shells: 1,
+                selected_shell_entity_id: None,
                 warnings: imported.warnings,
             })
         }
@@ -531,6 +537,41 @@ impl BodyOrientation {
 
     pub fn is_finite(self) -> bool {
         self.to_degrees().iter().all(|angle| angle.is_finite())
+    }
+
+    /// Rotate the body so its longest source extent lies along the fixed `+X`
+    /// free stream. Cross-stream (y/z) fit then uses the remaining face, which
+    /// keeps flat bricks and capsules above the critical-thickness gate without
+    /// leaving the trained characteristic-length band.
+    pub fn align_longest_extent_to_stream(extents: [f32; 3]) -> Self {
+        let mut longest = 0usize;
+        for axis in 1..3 {
+            if extents[axis] > extents[longest] {
+                longest = axis;
+            }
+        }
+        // Near-cube: leave the imported attitude alone.
+        let shortest = extents
+            .iter()
+            .copied()
+            .fold(f32::MAX, f32::min)
+            .max(1e-12);
+        if extents[longest] / shortest < 1.05 {
+            return Self::default();
+        }
+        match longest {
+            // +Y → +X via yaw −90°.
+            1 => Self {
+                yaw_deg: -90.0,
+                ..Self::default()
+            },
+            // +Z → +X via angle of attack −90°.
+            2 => Self {
+                angle_of_attack_deg: -90.0,
+                ..Self::default()
+            },
+            _ => Self::default(),
+        }
     }
 
     /// Row-major 3×3 rotation matrix `R_yaw · R_aoa · R_roll`.
@@ -1178,6 +1219,31 @@ mod tests {
         let ascii = "solid cube\n facet normal 0 0 0\n  outer loop\n   vertex 0 0 0\n   vertex 1 0 0\n   vertex 0 1 0\n  endloop\n endfacet\nendsolid";
         let m = parse_stl(ascii.as_bytes()).expect("ascii parse");
         assert_eq!(m.tris.len(), 1);
+    }
+
+    #[test]
+    fn parse_geometry_stl_records_no_shell_selection() {
+        let bin = cube_stl([0.0; 3], [1.0; 3]);
+        let imported = parse_geometry("body.stl", &bin).expect("stl parse");
+        assert_eq!(imported.source_shells, 1);
+        assert_eq!(imported.selected_shell_entity_id, None);
+    }
+
+    #[test]
+    fn parse_geometry_selecting_copies_step_pick_one_shell_id() {
+        let bytes = include_bytes!("../test-geometry/corpus/vendor/nist_ctc03_ap203_geom.step");
+        match parse_geometry_selecting("nist.step", bytes, None) {
+            Err(GeometryParseError::ChooseShell(choice)) => {
+                let selected = choice.shells[0].entity_id;
+                let imported = parse_geometry_selecting("nist.step", bytes, Some(selected))
+                    .expect("NIST multi-shell CTC should import after pick-one");
+                assert_eq!(imported.selected_shell_entity_id, Some(selected));
+            }
+            Ok(imported) => assert_eq!(imported.selected_shell_entity_id, None),
+            Err(GeometryParseError::Message(error)) => {
+                panic!("NIST CTC AP203 geometry should import: {error}")
+            }
+        }
     }
 
     #[test]

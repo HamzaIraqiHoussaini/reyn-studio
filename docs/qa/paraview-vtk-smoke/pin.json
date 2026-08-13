@@ -1,0 +1,39 @@
+{
+  "schema": "com.reyn.studio.paraview-vtk-smoke/1",
+  "paraview_version": "6.0.1",
+  "vtk_version_prefix": "9.4",
+  "fixture": "fixture.vtk",
+  "fixture_generator": "src/vtk_export.rs::tests::fixture",
+  "regenerate": "REYN_WRITE_PARAVIEW_VTK_FIXTURE=1 cargo test --bin reyn-studio golden_paraview_smoke_fixture_matches_exporter",
+  "expected": {
+    "vtk_data_file_version": "3.0",
+    "dataset": "STRUCTURED_GRID",
+    "dimensions": [3, 3, 3],
+    "point_count": 27,
+    "point_arrays": [
+      "velocity_m_per_s",
+      "recovered_pressure_pa",
+      "cp_dimensionless",
+      "traction_pa",
+      "solid_occupancy"
+    ],
+    "field_data_keys": [
+      "reyn_schema",
+      "source_revision_id",
+      "case_revision_id",
+      "run_id",
+      "model_sha256",
+      "contract_kind",
+      "field_sha256",
+      "run_state",
+      "coordinate_frame",
+      "coordinate_units",
+      "vector_frame",
+      "velocity_units",
+      "traction_units"
+    ],
+    "reyn_schema": "reyn.engineering_field.legacy_vtk_structured_grid.v1",
+    "coordinate_units": "m",
+    "run_state": "succeeded"
+  }
+}

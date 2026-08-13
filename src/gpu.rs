@@ -898,6 +898,9 @@ pub struct VolumeCallback {
     pub threshold: f32,
     pub volume: Option<VolumeData>,
     pub surface: Option<SurfaceData>,
+    /// Model streamline tubes drawn into the same HDR scene after the raymarch.
+    /// A separate `add_flow` callback would Clear the scene and wipe the body.
+    pub segments: Vec<SegInstance>,
 }
 
 impl CallbackTrait for VolumeCallback {
@@ -996,6 +999,47 @@ impl CallbackTrait for VolumeCallback {
                 rp.draw(0..3, 0..1);
             }
         }
+        // Composite model tubes without clearing the raymarched body/volume.
+        let ns = self.segments.len() as u64;
+        if ns > 0 {
+            if ns > r.seg_cap {
+                r.seg_cap = (ns + ns / 2).next_power_of_two();
+                r.segments = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("reyn.segments"),
+                    size: r.seg_cap * std::mem::size_of::<SegInstance>() as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
+            queue.write_buffer(&r.segments, 0, bytemuck::cast_slice(&self.segments));
+            let inv = [1.0 / size[0] as f32, 1.0 / size[1] as f32];
+            queue.write_buffer(
+                &r.particle_uni,
+                0,
+                bytemuck::cast_slice(&[inv[0], inv[1], 0.0, 0.0]),
+            );
+            let t = r.targets.as_ref().unwrap();
+            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("reyn.pass.volume_streamlines"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &t.scene,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rp.set_pipeline(&r.seg_pipe);
+            rp.set_bind_group(0, &r.particle_bg, &[]);
+            rp.set_vertex_buffer(0, r.segments.slice(..));
+            rp.draw(0..6, 0..self.segments.len() as u32);
+        }
         r.bloom_post(encoder);
         Vec::new()
     }
@@ -1082,6 +1126,8 @@ pub fn add_flow(
 
 /// Queue a bloom-lit **volume raymarch** for `rect`. `eye` and `target` are in
 /// domain space ([-1,1]³), `slice[a]` a clip coord in [-1,1] (or -2.0 = off).
+/// Optional `segments` are composited into the same HDR scene after the
+/// raymarch so model streamlines do not wipe the Cp body.
 #[allow(clippy::too_many_arguments)]
 pub fn add_volume(
     ui: &egui::Ui,
@@ -1095,6 +1141,7 @@ pub fn add_volume(
     shadows: bool,
     volume: Option<VolumeData>,
     surface: Option<SurfaceData>,
+    segments: Vec<SegInstance>,
 ) {
     let ppp = ui.ctx().pixels_per_point();
     let size_px = [
@@ -1110,11 +1157,13 @@ pub fn add_volume(
         density_hi,
         slice,
         shadows,
-        bloom_strength: 1.5,
-        exposure: 1.2,
-        threshold: 1.0,
+        // CAD surface-load shading reads poorly under the sandbox bloom amount.
+        bloom_strength: if surface.is_some() { 0.55 } else { 1.5 },
+        exposure: if surface.is_some() { 1.05 } else { 1.2 },
+        threshold: if surface.is_some() { 1.35 } else { 1.0 },
         volume,
         surface,
+        segments,
     };
     ui.painter_at(rect)
         .add(egui_wgpu::Callback::new_paint_callback(rect, cb));
@@ -1307,13 +1356,21 @@ fn solid_at(uvw: vec3<f32>) -> f32 {
   return textureSampleLevel(solid, vs, uvw, 0.0).r;
 }
 
-/// Recovered-pressure color map: blue (minimum) ↔ dark ↔ red (maximum).
+fn ray_clipped(pw: vec3<f32>) -> bool {
+  return (V.slice.x > -1.5 && pw.x < V.slice.x) ||
+         (V.slice.y > -1.5 && pw.y < V.slice.y) ||
+         (V.slice.z > -1.5 && pw.z < V.slice.z);
+}
+
+/// Recovered-pressure color map: blue (minimum) ↔ warm body ↔ red (maximum).
+/// The neutral base stays bright enough that a zero-Cp shell is still readable
+/// on the near-black Results canvas (a pure dark mix vanished into the well).
 fn load_color(t: f32) -> vec3<f32> {
-  let dark = vec3<f32>(0.10, 0.07, 0.06);
-  let red = vec3<f32>(0.95, 0.28, 0.22);
-  let blue = vec3<f32>(0.30, 0.55, 0.95);
-  if (t >= 0.0) { return mix(dark, red, clamp(t, 0.0, 1.0)); }
-  return mix(dark, blue, clamp(-t, 0.0, 1.0));
+  let body = vec3<f32>(0.78, 0.68, 0.58);
+  let red = vec3<f32>(0.95, 0.32, 0.24);
+  let blue = vec3<f32>(0.28, 0.52, 0.95);
+  if (t >= 0.0) { return mix(body, red, clamp(t, 0.0, 1.0)); }
+  return mix(body, blue, clamp(-t, 0.0, 1.0));
 }
 
 @fragment
@@ -1351,34 +1408,36 @@ fn fs_volume(in: FOut) -> @location(0) vec4<f32> {
   let dt = (tmax - start) / f32(STEPS);
   let ldir = normalize(vec3<f32>(0.4, 1.0, 0.35));
 
+  // Find the first solid hit so Q/vorticity fog cannot extinguish the ray
+  // before the Cp body is shaded (that read as a translucent blob).
+  var t_solid = tmax + 1.0;
+  var solid_uvw = vec3<f32>(0.0);
+  if (V.slice.w > 0.5) {
+    for (var i = 0; i < STEPS; i = i + 1) {
+      let t = start + (f32(i) + 0.5) * dt;
+      let pw = eye + dir * t;
+      if (ray_clipped(pw)) { continue; }
+      let uvw = pw * 0.5 + 0.5;
+      if (solid_at(uvw) > 0.5) {
+        t_solid = t;
+        solid_uvw = uvw;
+        break;
+      }
+    }
+  }
+
   var col = vec3<f32>(0.0);
   var trans = 1.0;
   for (var i = 0; i < STEPS; i = i + 1) {
     let t = start + (f32(i) + 0.5) * dt;
-    let pw = eye + dir * t; // domain-space position in [-1,1]^3
-    if ((V.slice.x > -1.5 && pw.x < V.slice.x) ||
-        (V.slice.y > -1.5 && pw.y < V.slice.y) ||
-        (V.slice.z > -1.5 && pw.z < V.slice.z)) { continue; }
+    if (t >= t_solid) { break; }
+    let pw = eye + dir * t;
+    if (ray_clipped(pw)) { continue; }
     let uvw = pw * 0.5 + 0.5;
-    // CAD body: the ray hit the solid — shade it with the surface load map
-    if (V.slice.w > 0.5 && solid_at(uvw) > 0.5) {
-      let e = 1.5 / 64.0;
-      let nrm = normalize(vec3<f32>(
-        solid_at(uvw - vec3<f32>(e, 0.0, 0.0)) - solid_at(uvw + vec3<f32>(e, 0.0, 0.0)),
-        solid_at(uvw - vec3<f32>(0.0, e, 0.0)) - solid_at(uvw + vec3<f32>(0.0, e, 0.0)),
-        solid_at(uvw - vec3<f32>(0.0, 0.0, e)) - solid_at(uvw + vec3<f32>(0.0, 0.0, e))) + vec3<f32>(1e-5));
-      let pv = textureSampleLevel(press, vs, uvw, 0.0).r * 2.0 - 1.0;
-      let lambert = 0.35 + 0.65 * max(dot(nrm, ldir), 0.0);
-      let rim = pow(1.0 - abs(dot(nrm, dir)), 2.0) * 0.25;
-      let surf = load_color(pv) * lambert + vec3<f32>(rim);
-      col = col + trans * surf;
-      trans = 0.0;
-      break;
-    }
     let s = dens(uvw);
     let d = smoothstep(dlo, dhi, s);
     if (d > 0.002) {
-      let a = d * 0.14; // per-step opacity
+      let a = d * 0.08;
       var lit = vec3<f32>(0.55 + 1.7 * s, 0.24 + 0.85 * s, 0.05 + 0.12 * s) * (0.5 + 3.2 * d);
       if (shadows > 0.5) {
         var occ = 0.0;
@@ -1392,8 +1451,20 @@ fn fs_volume(in: FOut) -> @location(0) vec4<f32> {
       }
       col = col + trans * a * lit;
       trans = trans * (1.0 - a);
-      if (trans < 0.01) { break; }
     }
+  }
+  if (t_solid <= tmax) {
+    let e = 1.5 / 64.0;
+    let nrm = normalize(vec3<f32>(
+      solid_at(solid_uvw - vec3<f32>(e, 0.0, 0.0)) - solid_at(solid_uvw + vec3<f32>(e, 0.0, 0.0)),
+      solid_at(solid_uvw - vec3<f32>(0.0, e, 0.0)) - solid_at(solid_uvw + vec3<f32>(0.0, e, 0.0)),
+      solid_at(solid_uvw - vec3<f32>(0.0, 0.0, e)) - solid_at(solid_uvw + vec3<f32>(0.0, 0.0, e))) + vec3<f32>(1e-5));
+    let pv = textureSampleLevel(press, vs, solid_uvw, 0.0).r * 2.0 - 1.0;
+    let lambert = 0.48 + 0.62 * max(dot(nrm, ldir), 0.0);
+    let rim = pow(1.0 - abs(dot(nrm, dir)), 2.0) * 0.32;
+    let surf = load_color(pv) * lambert + vec3<f32>(rim * 0.85);
+    col = col + trans * surf;
+    trans = 0.0;
   }
   return vec4<f32>(col, 1.0 - trans);
 }
@@ -1645,6 +1716,7 @@ mod tests {
                 version: 1,
             }),
             surface: None,
+            segments: Vec::new(),
         };
         let px = render(&device, &queue, cb.clone());
         let (center, corner) = (at(&px, 32, 32), at(&px, 6, 6));
@@ -1708,6 +1780,7 @@ mod tests {
                 mask_version: 1,
                 pressure_version: 1,
             }),
+            segments: Vec::new(),
         };
         let px = render(&device, &queue, cb);
         let o = ((32u32 * 4 * S) + 32 * 4) as usize;

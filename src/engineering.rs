@@ -11,6 +11,7 @@ use std::io::Write;
 pub const EXTERNAL_FLOW_CONTRACT: &str = "external_fixed_body.v1";
 pub const INTERNAL_FLOW_CONTRACT: &str = "internal_flow.reference_only.v1";
 pub const SURFACE_LOAD_METHOD: &str = "diffuse_interface_traction.v1";
+pub const REVIEW_FOCUS_SCHEMA_VERSION: u32 = 1;
 pub const ENGINEERING_RESULT_SCHEMA: &str = "engineering_result.v1";
 pub const ENGINEERING_FIELD_SCHEMA: &str = "engineering_field.f32le.v1";
 pub const FEA_LOAD_SCHEMA: &str = "reyn_fea_source_frame_surface_loads.v2";
@@ -108,6 +109,28 @@ impl LengthUnit {
     }
 }
 
+/// Where moments and CG-relative arms are measured.
+///
+/// The historical default remains the diffuse-surface area centroid computed
+/// from the immersed mask. Operators may instead pin a source-frame point
+/// (typical aerospace CG / moment-reference location).
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MomentOriginMode {
+    #[default]
+    DiffuseSurfaceCentroid,
+    SourceFramePoint,
+}
+
+impl MomentOriginMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::DiffuseSurfaceCentroid => "diffuse-surface area centroid",
+            Self::SourceFramePoint => "source-frame point (operator CG / moment origin)",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct OperatingPoint {
@@ -119,6 +142,16 @@ pub struct OperatingPoint {
     pub reference_pressure: f64,
     pub flow_direction: [f64; 3],
     pub horizon_steps: u32,
+    /// Moment / CG datum mode persisted in the immutable operating point.
+    pub moment_origin_mode: MomentOriginMode,
+    /// Source-frame coordinates in geometry length units (same unit as
+    /// `reference_length`). Used only when `moment_origin_mode` is
+    /// `SourceFramePoint`.
+    pub moment_origin_source: [f64; 3],
+    /// Optional aero reference area in m². When set, force/moment coefficients
+    /// are reported against `q∞·A` and `q∞·A·L`; dimensional loads are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_area_m2: Option<f64>,
 }
 
 impl Default for OperatingPoint {
@@ -132,9 +165,18 @@ impl Default for OperatingPoint {
             reference_pressure: 101_325.0,
             flow_direction: [1.0, 0.0, 0.0],
             horizon_steps: 4,
+            moment_origin_mode: MomentOriginMode::DiffuseSurfaceCentroid,
+            moment_origin_source: [0.0, 0.0, 0.0],
+            reference_area_m2: None,
         }
     }
 }
+
+/// Qualified external-flow Reynolds envelope for the shipped fixed-body contract.
+pub const QUALIFIED_REYNOLDS_MIN: f64 = 60.0;
+pub const QUALIFIED_REYNOLDS_MAX: f64 = 400.0;
+/// Mid-envelope target used when Studio proposes a free-stream that fits the model.
+pub const QUALIFIED_REYNOLDS_TARGET: f64 = 200.0;
 
 impl OperatingPoint {
     pub fn reynolds(&self) -> Option<f64> {
@@ -149,9 +191,72 @@ impl OperatingPoint {
         Some(self.density * self.velocity * self.reference_length * scale / self.viscosity)
     }
 
+    /// Free-stream speed that yields `target_re` for the current length unit,
+    /// reference length, density, and viscosity. Returns `None` when units are
+    /// unknown or any term is non-physical.
+    pub fn velocity_for_reynolds(&self, target_re: f64) -> Option<f64> {
+        let scale = self.length_unit.meters_per_unit()?;
+        if !(target_re.is_finite() && target_re > 0.0)
+            || self.reference_length <= 0.0
+            || !self.reference_length.is_finite()
+            || self.density <= 0.0
+            || !self.density.is_finite()
+            || self.viscosity <= 0.0
+            || !self.viscosity.is_finite()
+        {
+            return None;
+        }
+        let velocity = target_re * self.viscosity / (self.density * self.reference_length * scale);
+        velocity.is_finite().then_some(velocity).filter(|v| *v > 0.0)
+    }
+
+    pub fn reynolds_in_qualified_envelope(&self) -> bool {
+        self.reynolds()
+            .is_some_and(|re| (QUALIFIED_REYNOLDS_MIN..=QUALIFIED_REYNOLDS_MAX).contains(&re))
+    }
+
+    /// When units are known and Re is missing or outside the qualified band,
+    /// set free-stream to land near [`QUALIFIED_REYNOLDS_TARGET`]. Returns true
+    /// when velocity changed. Does not invent units or bypass transform approval.
+    pub fn retarget_velocity_to_qualified_reynolds(&mut self) -> bool {
+        if self.length_unit == LengthUnit::Unknown || self.reynolds_in_qualified_envelope() {
+            return false;
+        }
+        let Some(velocity) = self.velocity_for_reynolds(QUALIFIED_REYNOLDS_TARGET) else {
+            return false;
+        };
+        if (self.velocity - velocity).abs() <= 1e-12 * velocity.max(1.0) {
+            return false;
+        }
+        self.velocity = velocity;
+        true
+    }
+
     pub fn dynamic_pressure(&self) -> Option<f64> {
         (self.density > 0.0 && self.velocity > 0.0)
             .then_some(0.5 * self.density * self.velocity * self.velocity)
+    }
+
+    /// Source-frame moment origin in SI meters when the operator pinned a point.
+    pub fn moment_origin_source_m(&self) -> Option<[f64; 3]> {
+        if self.moment_origin_mode != MomentOriginMode::SourceFramePoint {
+            return None;
+        }
+        let scale = self.length_unit.meters_per_unit()?;
+        if self
+            .moment_origin_source
+            .iter()
+            .any(|component| !component.is_finite())
+        {
+            return None;
+        }
+        Some(self.moment_origin_source.map(|component| component * scale))
+    }
+
+    /// Aero reference area used for coefficient reporting, when declared.
+    pub fn aero_reference_area_m2(&self) -> Option<f64> {
+        self.reference_area_m2
+            .filter(|area| area.is_finite() && *area > 0.0)
     }
 
     pub fn validation(&self, max_steps: u32) -> Vec<String> {
@@ -167,6 +272,19 @@ impl OperatingPoint {
         }
         if !self.density.is_finite() || self.density <= 0.0 {
             issues.push("Density must be positive.".into());
+        }
+        if self.moment_origin_mode == MomentOriginMode::SourceFramePoint
+            && self
+                .moment_origin_source
+                .iter()
+                .any(|component| !component.is_finite())
+        {
+            issues.push("Moment origin coordinates must be finite.".into());
+        }
+        if let Some(area) = self.reference_area_m2 {
+            if !area.is_finite() || area <= 0.0 {
+                issues.push("Reference area must be positive when set.".into());
+            }
         }
         if !self.viscosity.is_finite() || self.viscosity <= 0.0 {
             issues.push("Dynamic viscosity must be positive.".into());
@@ -204,9 +322,9 @@ impl OperatingPoint {
             ));
         }
         if let Some(reynolds) = self.reynolds() {
-            if !(60.0..=400.0).contains(&reynolds) {
+            if !(QUALIFIED_REYNOLDS_MIN..=QUALIFIED_REYNOLDS_MAX).contains(&reynolds) {
                 issues.push(format!(
-                    "Reynolds number {reynolds:.1} lies outside the qualified 60–400 envelope."
+                    "Reynolds number {reynolds:.1} lies outside the qualified {QUALIFIED_REYNOLDS_MIN:.0}–{QUALIFIED_REYNOLDS_MAX:.0} envelope."
                 ));
             }
         }
@@ -256,6 +374,9 @@ pub struct GeometryPreflight {
     /// Ordered import/derivation steps for the current analyzed mesh and mask.
     pub import_steps: Vec<GeometryImportStep>,
     pub source_shells: usize,
+    /// STEP pick-one shell entity id. None for STL/3MF, single-shell STEP, and
+    /// records opened before this field existed.
+    pub selected_shell_entity_id: Option<u64>,
     pub triangles: usize,
     pub components: usize,
     pub degenerate_triangles: usize,
@@ -677,8 +798,11 @@ impl ModelSupport {
                 "No compatible verified 3D .reynmodel bundle is available; geometry review is available, but inference is blocked."
                     .into(),
             );
-        } else if self.status == "invalid" || self.status.trim().is_empty() {
-            issues.push("The selected checkpoint has no accepted validation state.".into());
+        } else if self.status != "clean" {
+            issues.push(format!(
+                "The selected checkpoint qualification state {:?} is not CLEAN.",
+                self.status
+            ));
         }
         if self.dimension != 3 {
             issues.push("External-geometry execution requires a 3D checkpoint.".into());
@@ -701,6 +825,13 @@ impl ModelSupport {
                 self.scenario
             ));
         }
+        if self.physics_contract != crate::engine::EXTERNAL_FLOW_MODEL_PHYSICS_CONTRACT {
+            issues.push(format!(
+                "The checkpoint physics contract {:?} is not {}.",
+                self.physics_contract,
+                crate::engine::EXTERNAL_FLOW_MODEL_PHYSICS_CONTRACT
+            ));
+        }
         issues
     }
 }
@@ -721,11 +852,143 @@ pub struct EngineeringResult {
     pub divergence_rms: f64,
     pub wake_deficit_peak: f64,
     pub wake_deficit_mean: f64,
+    /// Moment / CG datum recorded with the completed field.
+    #[serde(default)]
+    pub moment_origin_mode: String,
+    #[serde(default)]
+    pub moment_origin_solver: [f64; 3],
+    #[serde(default)]
+    pub surface_centroid_solver: [f64; 3],
+    #[serde(default)]
+    pub coefficient_reference: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_area_m2: Option<f64>,
     /// Legacy optional field. Engineering CAD no longer computes or displays
     /// semigroup; kept so older evidence JSON still deserializes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semigroup: Option<f64>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewQuantity {
+    #[default]
+    DragCoefficient,
+    SideForceCoefficient,
+    VerticalForceCoefficient,
+    MomentX,
+    MomentY,
+    MomentZ,
+    CpMinimum,
+    CpMaximum,
+    WakeDeficitPeak,
+    WakeDeficitMean,
+}
+
+impl ReviewQuantity {
+    pub const ALL: [Self; 10] = [
+        Self::DragCoefficient,
+        Self::SideForceCoefficient,
+        Self::VerticalForceCoefficient,
+        Self::MomentX,
+        Self::MomentY,
+        Self::MomentZ,
+        Self::CpMinimum,
+        Self::CpMaximum,
+        Self::WakeDeficitPeak,
+        Self::WakeDeficitMean,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::DragCoefficient => "Cd · drag (+X)",
+            Self::SideForceCoefficient => "Cs · side (+Y)",
+            Self::VerticalForceCoefficient => "Cl · vertical (+Z)",
+            Self::MomentX => "Cmx · roll",
+            Self::MomentY => "Cmy · pitch",
+            Self::MomentZ => "Cmz · yaw",
+            Self::CpMinimum => "Cp minimum",
+            Self::CpMaximum => "Cp maximum",
+            Self::WakeDeficitPeak => "Wake deficit · peak",
+            Self::WakeDeficitMean => "Wake deficit · mean",
+        }
+    }
+
+    pub fn value(self, result: &EngineeringResult) -> f64 {
+        match self {
+            Self::DragCoefficient => result.force_coefficients[0],
+            Self::SideForceCoefficient => result.force_coefficients[1],
+            Self::VerticalForceCoefficient => result.force_coefficients[2],
+            Self::MomentX => result.moment_coefficients[0],
+            Self::MomentY => result.moment_coefficients[1],
+            Self::MomentZ => result.moment_coefficients[2],
+            Self::CpMinimum => result.cp_min,
+            Self::CpMaximum => result.cp_max,
+            Self::WakeDeficitPeak => result.wake_deficit_peak,
+            Self::WakeDeficitMean => result.wake_deficit_mean,
+        }
+    }
+
+    pub fn scalar_key(self) -> &'static str {
+        match self {
+            Self::DragCoefficient => "force_coefficient_x",
+            Self::SideForceCoefficient => "force_coefficient_y",
+            Self::VerticalForceCoefficient => "force_coefficient_z",
+            Self::MomentX => "moment_coefficient_x",
+            Self::MomentY => "moment_coefficient_y",
+            Self::MomentZ => "moment_coefficient_z",
+            Self::CpMinimum => "cp_min",
+            Self::CpMaximum => "cp_max",
+            Self::WakeDeficitPeak => "wake_deficit_peak",
+            Self::WakeDeficitMean => "wake_deficit_mean",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ReviewFocus {
+    pub schema_version: u32,
+    pub primary: ReviewQuantity,
+}
+
+impl Default for ReviewFocus {
+    fn default() -> Self {
+        Self {
+            schema_version: REVIEW_FOCUS_SCHEMA_VERSION,
+            primary: ReviewQuantity::DragCoefficient,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadinessStage {
+    Geometry,
+    QualifiedModel,
+    FlowConditions,
+    ReviewFocus,
+    RunReadiness,
+}
+
+impl ReadinessStage {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Geometry => "Geometry",
+            Self::QualifiedModel => "Qualified Model",
+            Self::FlowConditions => "Flow Conditions",
+            Self::ReviewFocus => "Review Focus",
+            Self::RunReadiness => "Run Readiness",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ReadinessBlocker {
+    pub code: String,
+    pub stage: ReadinessStage,
+    pub message: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -742,6 +1005,8 @@ pub struct ExternalFlowCase {
     pub model_support: ModelSupport,
     pub preflight: GeometryPreflight,
     pub operating: OperatingPoint,
+    #[serde(default)]
+    pub review_focus: ReviewFocus,
     pub result: Option<EngineeringResult>,
     pub parent_run_id: Option<String>,
     /// Operator-authored region labels for future internal-flow / BC mapping.
@@ -758,6 +1023,67 @@ pub struct NamedRegionAssignment {
     pub name: String,
     pub candidate_id: String,
     pub role: String,
+    /// Persistent face identity kind when recovered from STEP/bridge.
+    /// Defaults to absent/heuristic so legacy projects reopen.
+    #[serde(default)]
+    pub identity_kind: String,
+    /// Stable face id for remap (STEP entity, ADVANCED_FACE name, or bridge id).
+    #[serde(default)]
+    pub stable_face_id: String,
+}
+
+impl NamedRegionAssignment {
+    pub fn face_identity(&self) -> reyn_studio::cad_identity::FaceIdentity {
+        use reyn_studio::cad_identity::{FaceIdentity, FaceIdentityKind};
+        let kind = match self.identity_kind.as_str() {
+            "heuristic_index" => FaceIdentityKind::HeuristicIndex,
+            "step_entity_id" => FaceIdentityKind::StepEntityId,
+            "step_advanced_face_name" => FaceIdentityKind::StepAdvancedFaceName,
+            "bridge_face_id" => FaceIdentityKind::BridgeFaceId,
+            _ => {
+                if self.candidate_id.starts_with("component-") {
+                    FaceIdentityKind::HeuristicIndex
+                } else {
+                    FaceIdentityKind::Absent
+                }
+            }
+        };
+        let stable_id = if self.stable_face_id.is_empty() {
+            self.candidate_id.clone()
+        } else {
+            self.stable_face_id.clone()
+        };
+        FaceIdentity::new(kind, stable_id)
+    }
+
+    pub fn named_region_identity(&self) -> reyn_studio::cad_identity::NamedRegionIdentity {
+        reyn_studio::cad_identity::NamedRegionIdentity {
+            name: self.name.clone(),
+            role: self.role.clone(),
+            identity: self.face_identity(),
+        }
+    }
+}
+
+/// Compare persisted named regions against a reimported candidate set.
+///
+/// Returns the remap report and fails closed when evidence-bound assignments
+/// would be remapped ambiguously or dropped.
+pub fn remap_named_regions_for_reimport(
+    previous: &[NamedRegionAssignment],
+    next: &[NamedRegionAssignment],
+) -> Result<reyn_studio::cad_identity::RegionRemapReport, String> {
+    let previous_ids = previous
+        .iter()
+        .map(NamedRegionAssignment::named_region_identity)
+        .collect::<Vec<_>>();
+    let next_ids = next
+        .iter()
+        .map(NamedRegionAssignment::named_region_identity)
+        .collect::<Vec<_>>();
+    let report = reyn_studio::cad_identity::diff_named_region_identities(&previous_ids, &next_ids);
+    reyn_studio::cad_identity::validate_region_remap_for_evidence(&report)?;
+    Ok(report)
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -805,6 +1131,7 @@ impl CaseDraftScope {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CaseDraftSnapshot {
     operating: OperatingPoint,
+    review_focus: ReviewFocus,
     transform_approved: bool,
     waivers: Vec<String>,
 }
@@ -813,6 +1140,7 @@ impl CaseDraftSnapshot {
     pub fn capture(case: &ExternalFlowCase) -> Self {
         Self {
             operating: case.operating.clone(),
+            review_focus: case.review_focus.clone(),
             transform_approved: case.preflight.transform_approved,
             waivers: case.preflight.waivers.clone(),
         }
@@ -820,6 +1148,7 @@ impl CaseDraftSnapshot {
 
     pub fn restore(&self, case: &mut ExternalFlowCase) {
         case.operating = self.operating.clone();
+        case.review_focus = self.review_focus.clone();
         case.preflight.transform_approved = self.transform_approved;
         case.preflight.waivers = self.waivers.clone();
     }
@@ -935,22 +1264,78 @@ impl CaseDraftHistory {
 }
 
 impl ExternalFlowCase {
-    pub fn readiness_issues(&self) -> Vec<String> {
-        let mut issues = self.preflight.blocking_issues();
-        issues.extend(self.operating.validation(self.model_max_steps));
+    pub fn readiness_blockers(&self) -> Vec<ReadinessBlocker> {
+        let mut blockers = self
+            .preflight
+            .blocking_issues()
+            .into_iter()
+            .enumerate()
+            .map(|(index, message)| ReadinessBlocker {
+                code: format!("geometry.{index}"),
+                stage: ReadinessStage::Geometry,
+                message,
+            })
+            .collect::<Vec<_>>();
+        blockers.extend(
+            self.operating
+                .validation(self.model_max_steps)
+                .into_iter()
+                .enumerate()
+                .map(|(index, message)| ReadinessBlocker {
+                    code: format!("flow.{index}"),
+                    stage: ReadinessStage::FlowConditions,
+                    message,
+                }),
+        );
         if self.model_id.trim().is_empty() {
-            issues.push("A qualified geometry-conditioned 3D model is required.".into());
+            blockers.push(ReadinessBlocker {
+                code: "model.identity_missing".into(),
+                stage: ReadinessStage::QualifiedModel,
+                message: "A qualified geometry-conditioned 3D model is required.".into(),
+            });
         }
         if self.model_sha256.as_deref().is_none_or(|digest| {
             digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
         }) {
-            issues.push("The selected model requires a recorded checkpoint SHA-256.".into());
+            blockers.push(ReadinessBlocker {
+                code: "model.digest_missing".into(),
+                stage: ReadinessStage::QualifiedModel,
+                message: "The selected model requires a recorded checkpoint SHA-256.".into(),
+            });
         }
         if self.model_max_steps == 0 {
-            issues.push("The selected model does not declare a supported horizon.".into());
+            blockers.push(ReadinessBlocker {
+                code: "model.horizon_missing".into(),
+                stage: ReadinessStage::QualifiedModel,
+                message: "The selected model does not declare a supported horizon.".into(),
+            });
         }
-        issues.extend(self.model_support.validation(self.preflight.target_grid));
-        issues
+        blockers.extend(
+            self.model_support
+                .validation(self.preflight.target_grid)
+                .into_iter()
+                .enumerate()
+                .map(|(index, message)| ReadinessBlocker {
+                    code: format!("model.contract.{index}"),
+                    stage: ReadinessStage::QualifiedModel,
+                    message,
+                }),
+        );
+        if self.review_focus.schema_version != REVIEW_FOCUS_SCHEMA_VERSION {
+            blockers.push(ReadinessBlocker {
+                code: "review_focus.version".into(),
+                stage: ReadinessStage::ReviewFocus,
+                message: "The saved Review Focus uses an unsupported schema version.".into(),
+            });
+        }
+        blockers
+    }
+
+    pub fn readiness_issues(&self) -> Vec<String> {
+        self.readiness_blockers()
+            .into_iter()
+            .map(|blocker| blocker.message)
+            .collect()
     }
 
     pub fn ready(&self) -> bool {
@@ -971,6 +1356,7 @@ impl ExternalFlowCase {
                 "support": self.model_support,
             },
             "operating_point": self.operating,
+            "review_focus": self.review_focus,
             "preflight": self.preflight,
             "surface_load_method": SURFACE_LOAD_METHOD,
             "named_regions": self.named_regions,
@@ -1166,27 +1552,45 @@ pub struct EngineeringFieldBlob {
 }
 
 pub fn encode_engineering_field(blob: &EngineeringFieldBlob) -> Result<Vec<u8>, String> {
-    let cube = blob
-        .n
-        .checked_mul(blob.n)
-        .and_then(|value| value.checked_mul(blob.n))
+    encode_engineering_field_slices(
+        blob.n,
+        &blob.velocity,
+        &blob.pressure_pa,
+        &blob.mask,
+        &blob.cp,
+        &blob.traction_pa,
+    )
+}
+
+/// Encode a completed engineering field from borrowed arrays (no clone of the
+/// `9 × N³` floats into an intermediate blob).
+pub fn encode_engineering_field_slices(
+    n: usize,
+    velocity: &[f32],
+    pressure_pa: &[f32],
+    mask: &[f32],
+    cp: &[f32],
+    traction_pa: &[f32],
+) -> Result<Vec<u8>, String> {
+    let cube = n
+        .checked_mul(n)
+        .and_then(|value| value.checked_mul(n))
         .ok_or_else(|| "Engineering field dimensions overflow.".to_string())?;
-    if blob.n < 3
-        || blob.velocity.len() != 3 * cube
-        || blob.pressure_pa.len() != cube
-        || blob.mask.len() != cube
-        || blob.cp.len() != cube
-        || blob.traction_pa.len() != 3 * cube
+    if n < 3
+        || velocity.len() != 3 * cube
+        || pressure_pa.len() != cube
+        || mask.len() != cube
+        || cp.len() != cube
+        || traction_pa.len() != 3 * cube
     {
         return Err("Engineering field arrays do not match the declared cubic grid.".into());
     }
-    if blob
-        .velocity
+    if velocity
         .iter()
-        .chain(&blob.pressure_pa)
-        .chain(&blob.mask)
-        .chain(&blob.cp)
-        .chain(&blob.traction_pa)
+        .chain(pressure_pa)
+        .chain(mask)
+        .chain(cp)
+        .chain(traction_pa)
         .any(|value| !value.is_finite())
     {
         return Err("Engineering field contains a non-finite value.".into());
@@ -1196,15 +1600,14 @@ pub fn encode_engineering_field(blob: &EngineeringFieldBlob) -> Result<Vec<u8>, 
         .ok_or_else(|| "Engineering field payload size overflows.".to_string())?;
     let mut bytes = Vec::with_capacity(16 + values * 4);
     bytes.extend_from_slice(b"REYNENG1");
-    bytes.extend_from_slice(&(blob.n as u32).to_le_bytes());
+    bytes.extend_from_slice(&(n as u32).to_le_bytes());
     bytes.extend_from_slice(&(values as u32).to_le_bytes());
-    for value in blob
-        .velocity
+    for value in velocity
         .iter()
-        .chain(&blob.pressure_pa)
-        .chain(&blob.mask)
-        .chain(&blob.cp)
-        .chain(&blob.traction_pa)
+        .chain(pressure_pa)
+        .chain(mask)
+        .chain(cp)
+        .chain(traction_pa)
     {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
@@ -1281,6 +1684,16 @@ pub struct FeaLoadProvenance {
     pub force_reconciliation_residual_newtons: [f64; 3],
     pub moment_reconciliation_residual_newton_meters: [f64; 3],
     pub moment_reference: String,
+    #[serde(default)]
+    pub moment_origin_mode: String,
+    #[serde(default)]
+    pub moment_origin_source_m: [f64; 3],
+    #[serde(default)]
+    pub moment_origin_solver: [f64; 3],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_area_m2: Option<f64>,
+    #[serde(default)]
+    pub coefficient_reference: String,
     pub integrated_surface_area_m2: f64,
     pub pressure_force_fraction: f64,
     pub reconciliation_method: String,
@@ -1590,6 +2003,45 @@ pub fn seconds_per_horizon_step(
     Some(dt_frame * reference_length_m / (solver_characteristic_length * velocity_mps))
 }
 
+/// Map a source-frame point in SI meters into the current solver coordinates
+/// using the column-major preprocessing transform and approved unit scale.
+pub fn source_m_to_solver_point(
+    source_m: [f64; 3],
+    transform_4x4: [f64; 16],
+    meters_per_source_unit: f64,
+) -> Result<[f64; 3], String> {
+    if !meters_per_source_unit.is_finite() || meters_per_source_unit <= 0.0 {
+        return Err("Source-unit conversion must be finite and positive.".into());
+    }
+    if source_m
+        .iter()
+        .chain(transform_4x4.iter())
+        .any(|component| !component.is_finite())
+    {
+        return Err("Source point or preprocessing transform contains a non-finite value.".into());
+    }
+    let source_units = source_m.map(|component| component / meters_per_source_unit);
+    let a = [
+        [transform_4x4[0], transform_4x4[4], transform_4x4[8]],
+        [transform_4x4[1], transform_4x4[5], transform_4x4[9]],
+        [transform_4x4[2], transform_4x4[6], transform_4x4[10]],
+    ];
+    Ok([
+        a[0][0] * source_units[0]
+            + a[0][1] * source_units[1]
+            + a[0][2] * source_units[2]
+            + transform_4x4[12],
+        a[1][0] * source_units[0]
+            + a[1][1] * source_units[1]
+            + a[1][2] * source_units[2]
+            + transform_4x4[13],
+        a[2][0] * source_units[0]
+            + a[2][1] * source_units[1]
+            + a[2][2] * source_units[2]
+            + transform_4x4[14],
+    ])
+}
+
 /// Convert a point from the current column-major solver transform back into the
 /// imported geometry source frame and then apply the approved source-unit scale.
 pub fn solver_point_to_source_m(
@@ -1710,6 +2162,62 @@ mod tests {
         let reynolds = operating.reynolds().unwrap();
         assert!((reynolds - 181.5).abs() < 0.5);
         assert!(operating.validation(64).is_empty());
+    }
+
+    #[test]
+    fn retarget_velocity_lands_mid_qualified_envelope_for_mm_cad() {
+        let mut operating = OperatingPoint {
+            length_unit: LengthUnit::Millimeter,
+            reference_length: 80.0,
+            velocity: 1.0,
+            density: 1.225,
+            viscosity: 1.81e-5,
+            ..Default::default()
+        };
+        assert!(!operating.reynolds_in_qualified_envelope());
+        assert!(operating.retarget_velocity_to_qualified_reynolds());
+        let reynolds = operating.reynolds().unwrap();
+        assert!(
+            (reynolds - QUALIFIED_REYNOLDS_TARGET).abs() < 1.0,
+            "expected ~{}, got {reynolds}",
+            QUALIFIED_REYNOLDS_TARGET
+        );
+        assert!(operating.reynolds_in_qualified_envelope());
+        assert!(!operating.retarget_velocity_to_qualified_reynolds());
+    }
+
+    #[test]
+    fn source_solver_point_round_trip_preserves_meters() {
+        let transform = [
+            2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.5, -0.25, 0.125, 1.0,
+        ];
+        let source_m = [1.2, -0.4, 0.8];
+        let solver = source_m_to_solver_point(source_m, transform, 1.0).unwrap();
+        let recovered = solver_point_to_source_m(solver, transform, 1.0).unwrap();
+        for axis in 0..3 {
+            assert!((recovered[axis] - source_m[axis]).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn operating_point_deserializes_without_moment_fields() {
+        let value = serde_json::json!({
+            "length_unit": "meter",
+            "reference_length": 1.0,
+            "velocity": 10.0,
+            "density": 1.225,
+            "viscosity": 1.81e-5,
+            "reference_pressure": 101325.0,
+            "flow_direction": [1.0, 0.0, 0.0],
+            "horizon_steps": 4
+        });
+        let operating: OperatingPoint = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            operating.moment_origin_mode,
+            MomentOriginMode::DiffuseSurfaceCentroid
+        );
+        assert_eq!(operating.moment_origin_source, [0.0, 0.0, 0.0]);
+        assert!(operating.reference_area_m2.is_none());
     }
 
     #[test]
@@ -1874,6 +2382,7 @@ mod tests {
                 horizon_steps: 4,
                 ..Default::default()
             },
+            review_focus: ReviewFocus::default(),
             result: None,
             parent_run_id: None,
             named_regions: Vec::new(),
@@ -1884,11 +2393,35 @@ mod tests {
         assert_eq!(contract["case_revision_id"], "case-revision-1");
         assert_eq!(contract["model"]["support"]["grid"], 32);
         assert_eq!(contract["surface_load_method"], SURFACE_LOAD_METHOD);
+        assert_eq!(
+            contract["review_focus"]["schema_version"],
+            REVIEW_FOCUS_SCHEMA_VERSION
+        );
         case.operating.flow_direction = [0.0, 1.0, 0.0];
-        assert!(case
-            .readiness_issues()
-            .iter()
-            .any(|issue| issue.contains("+X")));
+        let blockers = case.readiness_blockers();
+        assert!(blockers.iter().any(|blocker| {
+            blocker.stage == ReadinessStage::FlowConditions && blocker.message.contains("+X")
+        }));
+    }
+
+    #[test]
+    fn review_focus_defaults_when_opening_a_legacy_case() {
+        let mut value = serde_json::to_value(draft_case()).unwrap();
+        value
+            .as_object_mut()
+            .expect("case object")
+            .remove("review_focus");
+        let restored: ExternalFlowCase = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.review_focus, ReviewFocus::default());
+        assert_eq!(
+            restored.review_focus.primary.value(
+                restored
+                    .result
+                    .as_ref()
+                    .expect("fixture carries an engineering result")
+            ),
+            restored.result.as_ref().unwrap().force_coefficients[0]
+        );
     }
 
     #[test]
@@ -1973,6 +2506,11 @@ mod tests {
             force_reconciliation_residual_newtons: [0.0; 3],
             moment_reconciliation_residual_newton_meters: [0.0; 3],
             moment_reference: "diffuse-surface area centroid".into(),
+            moment_origin_mode: "diffuse_surface_centroid".into(),
+            moment_origin_source_m: [0.0; 3],
+            moment_origin_solver: [0.0; 3],
+            reference_area_m2: None,
+            coefficient_reference: "q_inf * L_ref^2 ; q_inf * L_ref^3".into(),
             integrated_surface_area_m2: 1.0,
             pressure_force_fraction: 0.8,
             reconciliation_method: "sample quadrature minus reported resultant".into(),
@@ -2190,6 +2728,7 @@ mod tests {
                 velocity: 10.0,
                 ..Default::default()
             },
+            review_focus: ReviewFocus::default(),
             result: Some(EngineeringResult {
                 method: SURFACE_LOAD_METHOD.into(),
                 ..Default::default()
@@ -2349,6 +2888,51 @@ mod tests {
                 edited.parent_run_id,
             ),
             immutable_current
+        );
+    }
+
+    #[test]
+    fn named_region_identity_fields_default_on_legacy_json() {
+        let region: NamedRegionAssignment = serde_json::from_str(
+            r#"{"name":"inlet","candidate_id":"component-0","role":"inlet"}"#,
+        )
+        .unwrap();
+        assert!(region.identity_kind.is_empty());
+        assert!(region.stable_face_id.is_empty());
+        assert_eq!(
+            region.face_identity().kind,
+            reyn_studio::cad_identity::FaceIdentityKind::HeuristicIndex
+        );
+    }
+
+    #[test]
+    fn heuristic_named_region_reimport_fails_closed() {
+        let previous = [NamedRegionAssignment {
+            name: "inlet".into(),
+            candidate_id: "component-0".into(),
+            role: "inlet".into(),
+            identity_kind: "heuristic_index".into(),
+            stable_face_id: "component-0".into(),
+        }];
+        let next = previous.clone();
+        let error = remap_named_regions_for_reimport(&previous, &next).unwrap_err();
+        assert!(error.contains("ambiguous"), "{error}");
+    }
+
+    #[test]
+    fn bridge_face_named_region_reimport_preserves() {
+        let previous = [NamedRegionAssignment {
+            name: "wall".into(),
+            candidate_id: "face:1".into(),
+            role: "wall".into(),
+            identity_kind: "bridge_face_id".into(),
+            stable_face_id: "face:1".into(),
+        }];
+        let report = remap_named_regions_for_reimport(&previous, &previous).unwrap();
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(
+            report.entries[0].class,
+            reyn_studio::cad_identity::RemapClass::Preserved
         );
     }
 }

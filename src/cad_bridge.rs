@@ -30,6 +30,8 @@ pub const STUB_OCCT_VERSION: &str = "none";
 pub const STUB_SLOW_MARKER: &str = "__slow__";
 /// Path marker that makes the stub treat the file as an assembly.
 pub const STUB_ASSEMBLY_MARKER: &str = "assembly";
+/// Stub occurrence paths returned by `list_occurrences` for assembly markers.
+pub const STUB_OCCURRENCE_PATHS: [&str; 2] = ["/Product/Part-1", "/Product/Part-2"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrameError {
@@ -231,6 +233,52 @@ fn tessellation_param_sha256(
     format!("{:x}", hasher.finalize())
 }
 
+fn identity_matrix_4x4() -> [f64; 16] {
+    [
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ]
+}
+
+fn stub_occurrence_transform(occurrence_path: &str) -> [f64; 16] {
+    let mut transform = identity_matrix_4x4();
+    if occurrence_path == STUB_OCCURRENCE_PATHS[1] {
+        // Part-2 is translated so hosts can prove occurrence transforms are not dropped.
+        transform[12] = 1.0;
+        transform[13] = 2.0;
+        transform[14] = 3.0;
+    }
+    transform
+}
+
+fn stub_occurrences(path: &str) -> Value {
+    let path_lower = path.to_ascii_lowercase();
+    if path_lower.contains(STUB_ASSEMBLY_MARKER) {
+        let occurrences = STUB_OCCURRENCE_PATHS
+            .iter()
+            .map(|occurrence_path| {
+                serde_json::json!({
+                    "path": occurrence_path,
+                    "name": occurrence_path.rsplit('/').next().unwrap_or(occurrence_path),
+                    "transform_4x4": stub_occurrence_transform(occurrence_path),
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "assembly": true,
+            "occurrences": occurrences,
+        })
+    } else {
+        serde_json::json!({
+            "assembly": false,
+            "occurrences": [{
+                "path": "/",
+                "name": "part",
+                "transform_4x4": identity_matrix_4x4(),
+            }],
+        })
+    }
+}
+
 fn mesh_ok(
     request_id: &str,
     path: &str,
@@ -240,16 +288,23 @@ fn mesh_ok(
     occurrence_path: Option<&str>,
 ) -> Value {
     let (positions, indices) = stub_fixture_mesh();
-    serde_json::json!({
+    let triangle_count = indices.len() / 3;
+    // One stable bridge face id per triangle so remap tests can exercise identity.
+    let triangle_face_ids = (0..triangle_count)
+        .map(|index| (index as u32) + 1)
+        .collect::<Vec<_>>();
+    let mut body = serde_json::json!({
         "schema": PROTOCOL_SCHEMA,
         "ok": true,
         "op": "tessellate_step",
         "request_id": request_id,
         "length_unit": "metre",
         "shell_count": 1,
-        "triangle_count": indices.len() / 3,
+        "triangle_count": triangle_count,
         "positions_f32le_b64": encode_f32_le_b64(&positions),
         "indices_u32le_b64": encode_u32_le_b64(&indices),
+        "face_identity_kind": "bridge_face_id",
+        "triangle_face_ids_u32le_b64": encode_u32_le_b64(&triangle_face_ids),
         "tessellation_param_sha256": tessellation_param_sha256(
             path,
             chord_tolerance,
@@ -260,7 +315,12 @@ fn mesh_ok(
         "warnings": [
             "stub bridge: fixed fixture mesh; OCCT tessellation not linked"
         ],
-    })
+    });
+    if let Some(occurrence) = occurrence_path {
+        body["occurrence_path"] = Value::String(occurrence.to_owned());
+        body["occurrence_transform_4x4"] = serde_json::json!(stub_occurrence_transform(occurrence));
+    }
+    body
 }
 
 fn is_cancelled(cancel_targets: &Mutex<HashSet<String>>, request_id: &str) -> bool {
@@ -281,6 +341,18 @@ pub fn handle_stub_work(
 
     match op {
         "hello" => Ok(hello_ok(request_id)),
+        "list_occurrences" => {
+            let path = require_str(request, "path")?;
+            let listing = stub_occurrences(path);
+            Ok(serde_json::json!({
+                "schema": PROTOCOL_SCHEMA,
+                "ok": true,
+                "op": "list_occurrences",
+                "request_id": request_id,
+                "assembly": listing["assembly"],
+                "occurrences": listing["occurrences"],
+            }))
+        }
         "tessellate_step" => {
             let path = require_str(request, "path")?;
             let chord_tolerance = request
@@ -305,6 +377,18 @@ pub fn handle_stub_work(
                     "occurrence_required",
                     "assemblies require an explicit occurrence_path (stub fail-closed)",
                 ));
+            }
+            if let Some(occurrence) = occurrence_path {
+                if path_lower.contains(STUB_ASSEMBLY_MARKER)
+                    && !STUB_OCCURRENCE_PATHS.contains(&occurrence)
+                {
+                    return Ok(error_response(
+                        "tessellate_step",
+                        request_id,
+                        "occurrence_not_found",
+                        format!("occurrence_path {occurrence} was not found in the stub assembly"),
+                    ));
+                }
             }
 
             if path_lower.contains(STUB_SLOW_MARKER) {
@@ -830,6 +914,61 @@ mod tests {
         .unwrap();
         assert_eq!(response["ok"], false);
         assert_eq!(response["code"], "occurrence_required");
+    }
+
+    #[test]
+    fn stub_lists_assembly_occurrences_and_returns_transform() {
+        let listing = in_process_stub_roundtrip(&serde_json::json!({
+            "schema": PROTOCOL_SCHEMA,
+            "op": "list_occurrences",
+            "request_id": "l1",
+            "path": "/tmp/widget_assembly.step",
+        }))
+        .unwrap();
+        assert_eq!(listing["ok"], true);
+        assert_eq!(listing["assembly"], true);
+        assert_eq!(listing["occurrences"].as_array().unwrap().len(), 2);
+
+        let mesh = in_process_stub_roundtrip(&serde_json::json!({
+            "schema": PROTOCOL_SCHEMA,
+            "op": "tessellate_step",
+            "request_id": "a2",
+            "path": "/tmp/widget_assembly.step",
+            "chord_tolerance": 0.001,
+            "max_triangles": 10_000,
+            "max_shells": 16,
+            "occurrence_path": STUB_OCCURRENCE_PATHS[1],
+        }))
+        .unwrap();
+        assert_eq!(mesh["ok"], true);
+        assert_eq!(mesh["occurrence_path"], STUB_OCCURRENCE_PATHS[1]);
+        assert_eq!(mesh["face_identity_kind"], "bridge_face_id");
+        let transform = mesh["occurrence_transform_4x4"]
+            .as_array()
+            .expect("transform");
+        assert_eq!(transform[12], 1.0);
+        assert_eq!(transform[13], 2.0);
+        assert_eq!(transform[14], 3.0);
+        let face_ids =
+            decode_u32_le_b64(mesh["triangle_face_ids_u32le_b64"].as_str().unwrap()).unwrap();
+        assert_eq!(face_ids, vec![1]);
+    }
+
+    #[test]
+    fn stub_rejects_unknown_occurrence_path() {
+        let response = in_process_stub_roundtrip(&serde_json::json!({
+            "schema": PROTOCOL_SCHEMA,
+            "op": "tessellate_step",
+            "request_id": "a3",
+            "path": "/tmp/widget_assembly.step",
+            "chord_tolerance": 0.001,
+            "max_triangles": 10_000,
+            "max_shells": 16,
+            "occurrence_path": "/Product/Missing",
+        }))
+        .unwrap();
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["code"], "occurrence_not_found");
     }
 
     #[test]

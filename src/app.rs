@@ -9,8 +9,9 @@ use crate::menubar::{MenuBar, MenuCommand, MenuSignal, MenuSyncState};
 use crate::signing::LocalSigningKeyStore;
 use crate::theme::*;
 use crate::{
-    cad, engine, engineering, engineering_export, engineering_section, flow, gpu, library, painter,
-    project, project_lifecycle, report, settings, signing, units, viewport, vtk_export,
+    cad, cad_field_ready, engine, engineering, engineering_export, engineering_section, flow, gpu,
+    library, painter, project, project_lifecycle, report, settings, signing, units, viewport,
+    vtk_export,
 };
 use egui::{
     Align, Align2, Color32, CornerRadius, FontId, Frame, Layout, Margin, Rect, RichText, Sense,
@@ -377,6 +378,7 @@ struct OrientationWorkRequest {
     angles: [f64; 3],
     grid: usize,
     source_bytes: Vec<u8>,
+    selected_shell_entity_id: Option<u64>,
 }
 
 struct OrientationWorkResult {
@@ -440,6 +442,23 @@ fn classify_orientation_result(
     }
 }
 
+fn geometry_setup_engine_status(
+    name: &str,
+    preflight: &engineering::GeometryPreflight,
+) -> String {
+    let geometry = format!(
+        "● {name}: {} triangles → {} solid voxels @ {}³",
+        preflight.triangles, preflight.solid_voxels, preflight.target_grid
+    );
+    if preflight.ready() {
+        format!("{geometry} · geometry accepted")
+    } else if !preflight.transform_approved {
+        format!("{geometry} · transform approval required")
+    } else {
+        format!("{geometry} · preflight incomplete")
+    }
+}
+
 struct GeometryImportWorkRequest {
     generation: u64,
     request_id: String,
@@ -476,6 +495,59 @@ struct GeometryImportWorkResult {
 struct GeometryImportWorker {
     request_tx: std::sync::mpsc::Sender<GeometryImportWorkRequest>,
     result_rx: std::sync::mpsc::Receiver<GeometryImportWorkResult>,
+}
+
+struct CadFieldReadyWorkRequest {
+    field: engine::CadField,
+    identity: cad_field_ready::CadFieldReadyIdentity,
+}
+
+struct CadFieldReadyWorkResult {
+    request_id: String,
+    outcome: Result<cad_field_ready::CadFieldReady, String>,
+}
+
+struct CadFieldReadyWorker {
+    request_tx: std::sync::mpsc::Sender<CadFieldReadyWorkRequest>,
+    result_rx: std::sync::mpsc::Receiver<CadFieldReadyWorkResult>,
+}
+
+struct PendingCadFieldReady {
+    request_id: String,
+    #[allow(dead_code)]
+    started_at: std::time::Instant,
+}
+
+impl CadFieldReadyWorker {
+    fn spawn(repaint_context: Option<egui::Context>) -> Result<Self, String> {
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<CadFieldReadyWorkRequest>();
+        let (result_tx, result_rx) = std::sync::mpsc::channel::<CadFieldReadyWorkResult>();
+        std::thread::Builder::new()
+            .name("reyn-cad-field-ready".into())
+            .spawn(move || {
+                while let Ok(request) = request_rx.recv() {
+                    let request_id = request.field.request_id.clone();
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        cad_field_ready::prepare_cad_field_ready(request.field, request.identity)
+                    }))
+                    .unwrap_or_else(|_| {
+                        Err("CAD field preparation worker panicked while encoding the completed field".into())
+                    });
+                    let _ = result_tx.send(CadFieldReadyWorkResult {
+                        request_id,
+                        outcome,
+                    });
+                    if let Some(ctx) = &repaint_context {
+                        ctx.request_repaint();
+                    }
+                }
+            })
+            .map_err(|error| format!("CAD field preparation worker failed to start: {error}"))?;
+        Ok(Self {
+            request_tx,
+            result_rx,
+        })
+    }
 }
 
 struct PendingGeometryImport {
@@ -517,7 +589,14 @@ impl GeometryImportWorker {
                         ) {
                             Ok(imported) => {
                                 let diagnostics = cad::diagnose_mesh(&imported.mesh);
-                                match cad::voxelize(&imported.mesh, request.grid) {
+                                let orientation = cad::BodyOrientation::align_longest_extent_to_stream(
+                                    diagnostics.extents,
+                                );
+                                match cad::voxelize_oriented(
+                                    &imported.mesh,
+                                    request.grid,
+                                    orientation,
+                                ) {
                                     Ok(voxel) => Ok(GeometryImportReady {
                                         imported,
                                         diagnostics,
@@ -579,15 +658,19 @@ impl OrientationWorker {
                     // generation is suppressed by the UI if it was superseded.
                     let request = coalesce_orientation_requests(request, &request_rx);
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        cad::parse_geometry(&request.source_name, &request.source_bytes).and_then(
-                            |imported| {
-                                cad::voxelize_oriented(
-                                    &imported.mesh,
-                                    request.grid,
-                                    cad::BodyOrientation::from_degrees(request.angles),
-                                )
-                            },
+                        cad::parse_geometry_selecting(
+                            &request.source_name,
+                            &request.source_bytes,
+                            request.selected_shell_entity_id,
                         )
+                        .map_err(String::from)
+                        .and_then(|imported| {
+                            cad::voxelize_oriented(
+                                &imported.mesh,
+                                request.grid,
+                                cad::BodyOrientation::from_degrees(request.angles),
+                            )
+                        })
                     }))
                     .unwrap_or_else(|_| {
                         Err("orientation worker panicked while re-voxelizing geometry".into())
@@ -776,6 +859,30 @@ fn retain_after_persistence<T, O>(
     Ok((durable, transient))
 }
 
+/// Map a CAD vorticity volume onto raymarch thresholds the operator can see.
+///
+/// Sandbox defaults (`density_lo ≈ 0.85`) assume dense procedural fields. A
+/// fixed-body CAD prediction concentrates |ω| in a thin wake, so those defaults
+/// erase the fluid and leave only a tiny unfitted body on a black canvas.
+fn calibrate_cad_volume_density(volume: &[u8]) -> (f32, f32) {
+    let mut nonzero: Vec<u8> = volume.iter().copied().filter(|&value| value > 0).collect();
+    if nonzero.is_empty() {
+        return (0.05, 0.45);
+    }
+    nonzero.sort_unstable();
+    let percentile = |p: f32| -> f32 {
+        let index = ((p * (nonzero.len() as f32 - 1.0)).round() as usize).min(nonzero.len() - 1);
+        nonzero[index] as f32 / 255.0
+    };
+    let mut lo = percentile(0.45).clamp(0.08, 0.45);
+    let mut hi = percentile(0.92).clamp(lo + 0.10, 0.95);
+    if hi - lo < 0.10 {
+        hi = (lo + 0.22).min(0.95);
+        lo = (hi - 0.22).max(0.08);
+    }
+    (lo, hi)
+}
+
 /// The fields the result views should draw this frame, and which horizon step
 /// they belong to.
 struct DisplayFields<'a> {
@@ -881,12 +988,76 @@ enum CaseEditTransaction {
     Viscosity,
     ReferencePressure,
     Horizon,
+    MomentOrigin,
+    ReferenceArea,
 }
 
 #[derive(Clone, Copy)]
 enum CaseHistoryAction {
     Undo,
     Redo,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ModelInventoryState {
+    Loading,
+    Ready,
+    Failed(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ModelSelectorMode {
+    Loading,
+    Failed(String),
+    NoneQualified,
+    OneQualified(String),
+    MultipleQualified,
+    StoredModelMissing(String),
+}
+
+fn model_selector_mode(
+    state: &ModelInventoryState,
+    models: &[engine::ModelCard],
+    stored_model_id: &str,
+    target_grid: usize,
+) -> ModelSelectorMode {
+    match state {
+        ModelInventoryState::Loading => ModelSelectorMode::Loading,
+        ModelInventoryState::Failed(error) => ModelSelectorMode::Failed(error.clone()),
+        ModelInventoryState::Ready => {
+            let qualified = models
+                .iter()
+                .filter(|model| engine::is_qualified_external_flow_model(model, target_grid))
+                .collect::<Vec<_>>();
+            if !stored_model_id.trim().is_empty()
+                && !qualified.iter().any(|model| model.id == stored_model_id)
+            {
+                ModelSelectorMode::StoredModelMissing(stored_model_id.into())
+            } else {
+                match qualified.as_slice() {
+                    [] => ModelSelectorMode::NoneQualified,
+                    [model] => ModelSelectorMode::OneQualified(model.id.clone()),
+                    _ => ModelSelectorMode::MultipleQualified,
+                }
+            }
+        }
+    }
+}
+
+fn bind_external_flow_model(case: &mut CadCase, model: &engine::ModelCard) {
+    case.model = model.id.clone();
+    case.workflow.model_id = model.id.clone();
+    case.workflow.model_sha256 = Some(model.checkpoint_sha256.clone());
+    case.workflow.model_max_steps = model.max_steps;
+    case.workflow.model_support = engineering::ModelSupport {
+        status: model.status.clone(),
+        dimension: model.dimension,
+        grid: model.grid,
+        input_channels: model.in_channels,
+        output_channels: model.out_channels,
+        scenario: model.scenario.clone(),
+        physics_contract: model.physics_contract.clone(),
+    };
 }
 
 pub struct ReynApp {
@@ -917,6 +1088,7 @@ pub struct ReynApp {
     last_window_title: String,
     current_model: String,
     models: Vec<engine::ModelCard>,
+    model_inventory_state: ModelInventoryState,
     library: library::LibraryState,
     library_pending_request: Option<engine::RequestContext>,
     settings: settings::AppSettings,
@@ -925,6 +1097,8 @@ pub struct ReynApp {
     signing_notice: Option<(String, bool)>,
     settings_ui: settings::SettingsUiState,
     updater: Option<crate::updater::Updater>,
+    sign_out_requested: bool,
+    study_focus_stage: Option<engineering::ReadinessStage>,
     /// Session copy of the per-field Case Setup entry units (seeded from
     /// settings; switching a unit here never changes the stored SI value).
     input_units: units::InputUnitPrefs,
@@ -948,6 +1122,13 @@ pub struct ReynApp {
     /// faked — the case is gated exactly as a hand-imported one.
     qa_import_path: Option<std::path::PathBuf>,
     qa_import_waited: u32,
+    /// Dev/QA hook (REYN_STUDIO_APPROVE_TRANSFORM=1): after a successful import,
+    /// tick the ordinary units/transform approval checkbox so Case Setup can be
+    /// captured past the hard setup gate. Does not waive geometry defects.
+    qa_approve_transform: bool,
+    /// Dev/QA hook (REYN_STUDIO_RUN_ANALYSIS=1): once the case is ready and a
+    /// qualified model is installed, start the ordinary external-flow run.
+    qa_run_analysis: bool,
     project: project_lifecycle::ProjectLifecycle,
     project_name_draft: String,
     project_guard: project_lifecycle::UnsavedChangesGuard,
@@ -964,9 +1145,14 @@ pub struct ReynApp {
     live_timer: f32,
     gpu_ready: bool,
     render_volume: bool,
+    /// Thin Q-criterion iso via the volume raymarch when wake volume is off.
+    q_iso_on: bool,
     volume_data: std::sync::Arc<Vec<u8>>,
     volume_dims: [u32; 3],
     volume_version: u64,
+    /// Positive-Q scalar volume for the optional thin iso layer.
+    q_volume_data: std::sync::Arc<Vec<u8>>,
+    q_volume_dims: [u32; 3],
     // N3 — 2D pressure-recovery view
     f2d: Option<engine::Field2D>,
     f2d_var: FieldVar,
@@ -1054,6 +1240,8 @@ pub struct ReynApp {
     geometry_import_worker: Option<GeometryImportWorker>,
     geometry_import_generation: u64,
     geometry_import_pending: Option<PendingGeometryImport>,
+    cad_field_ready_worker: Option<CadFieldReadyWorker>,
+    cad_field_ready_pending: Option<PendingCadFieldReady>,
     pending_shell_choice: Option<PendingShellChoice>,
     /// Session-only, bounded history of reversible case-draft inputs. Immutable
     /// source/model/run/evidence identity never enters these snapshots.
@@ -1103,6 +1291,13 @@ impl Default for ReynApp {
             last_window_title: String::new(),
             current_model,
             models: Vec::new(),
+            model_inventory_state: if library_pending_request.is_some() {
+                ModelInventoryState::Loading
+            } else {
+                ModelInventoryState::Failed(
+                    "The model inventory request could not be started.".into(),
+                )
+            },
             library: library::LibraryState::default(),
             library_pending_request,
             settings_draft: settings.clone(),
@@ -1111,6 +1306,8 @@ impl Default for ReynApp {
             signing_notice: None,
             settings_ui: settings::SettingsUiState::default(),
             updater: None,
+            sign_out_requested: false,
+            study_focus_stage: None,
             input_units: units::InputUnitPrefs::default(),
             preset_name_draft: String::new(),
             preset_notice: None,
@@ -1128,6 +1325,14 @@ impl Default for ReynApp {
                 .ok()
                 .map(std::path::PathBuf::from),
             qa_import_waited: 0,
+            qa_approve_transform: matches!(
+                std::env::var("REYN_STUDIO_APPROVE_TRANSFORM").as_deref(),
+                Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+            ),
+            qa_run_analysis: matches!(
+                std::env::var("REYN_STUDIO_RUN_ANALYSIS").as_deref(),
+                Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+            ),
             project,
             project_name_draft,
             project_guard: project_lifecycle::UnsavedChangesGuard::default(),
@@ -1141,9 +1346,12 @@ impl Default for ReynApp {
             live_timer: 0.0,
             gpu_ready: false,
             render_volume: false,
+            q_iso_on: false,
             volume_data: std::sync::Arc::new(vol),
             volume_dims: vdims,
             volume_version: 1,
+            q_volume_data: std::sync::Arc::new(Vec::new()),
+            q_volume_dims: [1, 1, 1],
             f2d: None,
             f2d_var: FieldVar::Vorticity,
             f2d_horizon: 8,
@@ -1213,6 +1421,8 @@ impl Default for ReynApp {
             geometry_import_worker: None,
             geometry_import_generation: 0,
             geometry_import_pending: None,
+            cad_field_ready_worker: None,
+            cad_field_ready_pending: None,
             pending_shell_choice: None,
             orientation_generation: 0,
             orientation_pending: None,
@@ -1253,6 +1463,10 @@ impl AppBootstrap {
 }
 
 impl ReynApp {
+    pub fn take_sign_out_request(&mut self) -> bool {
+        std::mem::take(&mut self.sign_out_requested)
+    }
+
     fn new_from_bootstrap(bootstrap: &AppBootstrap) -> Self {
         let mut app = Self {
             repaint_context: Some(bootstrap.repaint_context.clone()),
@@ -1428,6 +1642,7 @@ impl eframe::App for ReynApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.handle_orientation_results();
         self.handle_geometry_import_results();
+        self.handle_cad_field_ready_results();
         self.draw_shell_choice_modal(ui.ctx());
         self.handle_screenshot_write_results();
         // Complete any in-flight viewport PNG capture first: the screenshot
@@ -1435,6 +1650,8 @@ impl eframe::App for ReynApp {
         self.handle_qa_shot(ui.ctx());
         self.handle_screenshot_events(ui.ctx());
         self.handle_qa_import();
+        self.handle_qa_approve_transform();
+        self.handle_qa_run_analysis();
         // Drain engine messages without allowing a queued burst to monopolize
         // the UI thread. The forwarding bridge wakes the first frame; hitting
         // the budget below explicitly schedules the continuation.
@@ -1469,6 +1686,7 @@ impl eframe::App for ReynApp {
                         continue;
                     }
                     self.models = m;
+                    self.model_inventory_state = ModelInventoryState::Ready;
                     self.library.busy = false;
                     self.library_pending_request = None;
                 }
@@ -1490,6 +1708,7 @@ impl eframe::App for ReynApp {
                         false,
                     ));
                     self.models = models;
+                    self.model_inventory_state = ModelInventoryState::Ready;
                     self.activate_model(&model.id);
                 }
                 engine::Msg::ModelImportRejected(validation) => {
@@ -1519,6 +1738,7 @@ impl eframe::App for ReynApp {
                     self.library.pending_delete = None;
                     self.library.notice = Some((format!("Deleted {model}"), false));
                     self.models = models;
+                    self.model_inventory_state = ModelInventoryState::Ready;
                 }
                 engine::Msg::Field(f) => {
                     let ps = flow::from_field(&f.shape, &f.data);
@@ -1598,121 +1818,7 @@ impl eframe::App for ReynApp {
                         }
                         CadResultDisposition::Record => {}
                     }
-                    self.invalidate_cad_section();
-                    let (persisted_run_id, f) = match retain_after_persistence(f, |field| {
-                        self.persist_external_flow_run(field)
-                    }) {
-                        Ok(persisted) => persisted,
-                        Err(error) => {
-                            if let Some(case) = self.cad.as_mut() {
-                                case.pending = false;
-                                case.pending_request_id = None;
-                                case.pending_run = None;
-                                case.workflow.stage = if case.workflow.ready() {
-                                    engineering::CaseStage::Ready
-                                } else {
-                                    engineering::CaseStage::Setup
-                                };
-                            }
-                            self.project_notice = Some((
-                                format!(
-                                    "Prediction completed, but immutable run persistence failed and the transient result was discarded: {error}"
-                                ),
-                                true,
-                            ));
-                            continue;
-                        }
-                    };
-                    let shape = [3usize, f.n, f.n, f.n];
-                    let ps = flow::from_field(&shape, &f.vel);
-                    if !ps.is_empty() {
-                        self.particles = ps;
-                    }
-                    if let Some((vol, dims)) = flow::vorticity_volume(&shape, &f.vel) {
-                        self.volume_data = std::sync::Arc::new(vol);
-                        self.volume_dims = dims;
-                        self.volume_version = self.volume_version.wrapping_add(1);
-                    }
-                    let mut ins = flow::insights3d(&shape, &f.vel);
-                    ins.extend(cad::surface_insights(&f.mask, &f.cp, f.n));
-                    self.insights3d = ins;
-                    // surface layer textures (transposed to x-fastest for wgpu)
-                    let n = f.n;
-                    let mask_bounds = cad::mask_bounds(&f.mask, n);
-                    let cp_scale =
-                        f.cp.iter()
-                            .fold(0.0f32, |scale, value| scale.max(value.abs()))
-                            .max(1e-6);
-                    let mut mask_u8 = vec![0u8; n * n * n];
-                    let mut p_u8 = vec![128u8; n * n * n];
-                    for i in 0..n {
-                        for j in 0..n {
-                            for k in 0..n {
-                                let src = i * n * n + j * n + k;
-                                let dst = (k * n + j) * n + i;
-                                mask_u8[dst] = (f.mask[src].clamp(0.0, 1.0) * 255.0) as u8;
-                                let t = (f.cp[src] / cp_scale) * 0.5 + 0.5;
-                                p_u8[dst] = (t.clamp(0.0, 1.0) * 255.0) as u8;
-                            }
-                        }
-                    }
-                    self.cad_version = self.cad_version.wrapping_add(1);
-                    let surf = gpu::SurfaceData {
-                        mask: std::sync::Arc::new(mask_u8),
-                        pressure: std::sync::Arc::new(p_u8),
-                        dims: [n as u32; 3],
-                        mask_version: self.cad_version,
-                        pressure_version: self.cad_version,
-                    };
-                    if let Some(c) = &mut self.cad {
-                        c.mask = std::sync::Arc::new(f.mask);
-                        c.mask_bounds = mask_bounds;
-                        c.surf = Some(surf);
-                        c.surf_mask_source = Some(c.mask.clone());
-                        c.steps = f.horizon;
-                        c.velocity = f.vel;
-                        c.pressure = f.pressure;
-                        c.cp = f.cp;
-                        c.traction = f.traction;
-                        c.result_grid = f.n;
-                        c.dt_frame = f.dt_frame;
-                        c.pending = false;
-                        c.pending_request_id = None;
-                        c.pending_run = None;
-                        // Playback opens on the step that was just recorded.
-                        c.playback.reset();
-                        c.active_run_id = Some(persisted_run_id);
-                        c.workflow.stage = engineering::CaseStage::Results;
-                        c.workflow.parent_run_id = c.active_run_id.clone();
-                        c.workflow.result = Some(engineering::EngineeringResult {
-                            method: f.load_method,
-                            cp_min: c.cp.iter().copied().fold(f32::INFINITY, f32::min) as f64,
-                            cp_max: c.cp.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64,
-                            force_coefficients: f.force_coefficients.map(f64::from),
-                            moment_coefficients: f.moment_coefficients.map(f64::from),
-                            force_newtons: f.force_newtons.map(f64::from),
-                            moment_newton_meters: f.moment_newton_meters.map(f64::from),
-                            surface_area_m2: f.surface_area_m2 as f64,
-                            pressure_force_fraction: f.pressure_force_fraction as f64,
-                            load_hotspot: f.load_hotspot.map(f64::from),
-                            suction_hotspot: f.suction_hotspot.map(f64::from),
-                            divergence_rms: f.divergence_rms as f64,
-                            wake_deficit_peak: f.wake_deficit_peak as f64,
-                            wake_deficit_mean: f.wake_deficit_mean as f64,
-                            semigroup: f.semigroup.map(f64::from),
-                            warnings: f.warnings,
-                        });
-                    }
-                    self.probe3d = None;
-                    self.surface_on = true;
-                    self.volumetric = true;
-                    self.render_volume = true;
-                    self.nav = Nav::Results;
-                    self.engine_status = format!(
-                        "● Engineering result {}³ · Re {:.0} · horizon step {} of {}",
-                        n, f.reynolds, f.horizon, f.horizon
-                    );
-                    self.engine_ok = true;
+                    self.enqueue_cad_field_ready(f);
                 }
                 engine::Msg::Benchmark(b) => {
                     self.bench_running = false;
@@ -1889,6 +1995,10 @@ impl eframe::App for ReynApp {
                             {
                                 self.library.busy = false;
                                 self.library_pending_request = None;
+                                if kind == engine::RequestKind::ListModels {
+                                    self.model_inventory_state =
+                                        ModelInventoryState::Failed(e.clone());
+                                }
                                 self.library.notice = Some((e, true));
                             }
                         }
@@ -2128,6 +2238,45 @@ fn now_utc_unix() -> u64 {
 /// Section eyebrow — the single sanctioned caps style (`overline`, §3.1):
 /// tracked, Medium weight, tertiary color. Scientific-state tokens use
 /// `theme::chip_text`; everything else is sentence case.
+/// Caption label that AccessKit controls can attach via [`egui::Response::labelled_by`].
+fn a11y_caption(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.label(RichText::new(text).text_style(caption()).color(TEXT_MUTE))
+}
+
+/// Build engine request fields for the case's moment origin / aero reference.
+fn cad_moment_engine_args(
+    operating: &engineering::OperatingPoint,
+    transform_4x4: [f64; 16],
+) -> Result<(String, Option<[f32; 3]>, Option<f32>), String> {
+    let mode = match operating.moment_origin_mode {
+        engineering::MomentOriginMode::DiffuseSurfaceCentroid => {
+            "diffuse_surface_centroid".to_string()
+        }
+        engineering::MomentOriginMode::SourceFramePoint => "source_frame_point".to_string(),
+    };
+    let origin = match operating.moment_origin_mode {
+        engineering::MomentOriginMode::DiffuseSurfaceCentroid => None,
+        engineering::MomentOriginMode::SourceFramePoint => {
+            let scale = operating.length_unit.meters_per_unit().ok_or_else(|| {
+                "Moment origin requires confirmed geometry units.".to_string()
+            })?;
+            let source_m = operating.moment_origin_source_m().ok_or_else(|| {
+                "Moment origin coordinates are incomplete or non-finite.".to_string()
+            })?;
+            let solver =
+                engineering::source_m_to_solver_point(source_m, transform_4x4, scale)?;
+            Some([solver[0] as f32, solver[1] as f32, solver[2] as f32])
+        }
+    };
+    Ok((
+        mode,
+        origin,
+        operating
+            .aero_reference_area_m2()
+            .map(|area| area as f32),
+    ))
+}
+
 fn caps(text: &str) -> RichText {
     overline_text(text)
 }
@@ -2392,6 +2541,7 @@ impl ReynApp {
     }
 
     fn clear_pending_external_flow(&mut self) {
+        self.cad_field_ready_pending = None;
         if let Some(case) = self.cad.as_mut() {
             case.pending = false;
             case.pending_request_id = None;
@@ -2544,6 +2694,18 @@ impl ReynApp {
             .length_unit
             .meters_per_unit()
             .unwrap_or(1.0);
+        let (moment_origin_mode, moment_origin_solver, reference_area_m2) =
+            match cad_moment_engine_args(
+                &case.workflow.operating,
+                case.workflow.preflight.transform_4x4,
+            ) {
+                Ok(args) => args,
+                Err(error) => {
+                    case.playback.failed.insert(step);
+                    self.project_notice = Some((error, true));
+                    return;
+                }
+            };
         let request_id = format!("cad-horizon-{}", uuid::Uuid::new_v4());
         let request = engine::Cmd::CadPredict {
             request_id: request_id.clone(),
@@ -2557,6 +2719,9 @@ impl ReynApp {
             velocity_mps: case.workflow.operating.velocity as f32,
             density_kg_m3: case.workflow.operating.density as f32,
             reference_pressure_pa: case.workflow.operating.reference_pressure as f32,
+            moment_origin_mode,
+            moment_origin_solver,
+            reference_area_m2,
         };
         if self.engine.send(request).is_err() {
             case.playback.failed.insert(step);
@@ -2711,7 +2876,7 @@ impl ReynApp {
                         for k in 0..n {
                             let source = i * n * n + j * n + k;
                             let target = (k * n + j) * n + i;
-                            mask_u8[target] = (fields.mask[source].clamp(0.0, 1.0) * 255.0) as u8;
+                            mask_u8[target] = cad_field_ready::surface_mask_u8_sample(fields.mask[source]);
                         }
                     }
                 }
@@ -2871,6 +3036,7 @@ impl ReynApp {
         let grid = case.workflow.preflight.target_grid;
         let case_id = case.workflow.case_id.clone();
         let source_name = case.workflow.source_name.clone();
+        let selected_shell_entity_id = case.workflow.preflight.selected_shell_entity_id;
         let Some(bytes) = self.project.content_bytes(&digest).map(<[u8]>::to_vec) else {
             self.project_notice = Some((
                 format!(
@@ -2904,6 +3070,7 @@ impl ReynApp {
             angles,
             grid,
             source_bytes: bytes,
+            selected_shell_entity_id,
         };
         let sent = self
             .orientation_worker
@@ -3534,6 +3701,14 @@ impl ReynApp {
             return;
         }
 
+        let (moment_origin_mode, moment_origin_solver, reference_area_m2) =
+            match cad_moment_engine_args(&workflow.operating, workflow.preflight.transform_4x4) {
+                Ok(args) => args,
+                Err(error) => {
+                    self.project_notice = Some((error, true));
+                    return;
+                }
+            };
         let request = engine::Cmd::CadPredict {
             request_id: request_id.clone(),
             model,
@@ -3545,6 +3720,9 @@ impl ReynApp {
             velocity_mps: workflow.operating.velocity as f32,
             density_kg_m3: workflow.operating.density as f32,
             reference_pressure_pa: workflow.operating.reference_pressure as f32,
+            moment_origin_mode,
+            moment_origin_solver,
+            reference_area_m2,
         };
         let Some(case) = self.cad.as_mut() else {
             return;
@@ -3587,7 +3765,238 @@ impl ReynApp {
         ));
     }
 
-    fn persist_external_flow_run(&mut self, field: &engine::CadField) -> Result<String, String> {
+    fn enqueue_cad_field_ready(&mut self, field: engine::CadField) {
+        let Some(case) = self.cad.as_ref() else {
+            self.project_notice = Some((
+                "CAD result arrived without an active case and was discarded.".into(),
+                true,
+            ));
+            return;
+        };
+        let Some(pending) = case
+            .pending_run
+            .as_ref()
+            .filter(|pending| pending.request_id == field.request_id)
+        else {
+            self.project_notice = Some((
+                format!(
+                    "CAD result request {} does not match the submitted run contract and was discarded.",
+                    short_id(&field.request_id)
+                ),
+                true,
+            ));
+            return;
+        };
+        let case_revision_id = match pending.workflow.case_revision_id.clone() {
+            Some(revision) => revision,
+            None => {
+                self.fail_cad_field_ready_queue(
+                    "active case revision missing".into(),
+                );
+                return;
+            }
+        };
+        if self.cad_field_ready_worker.is_none() {
+            self.cad_field_ready_worker =
+                match CadFieldReadyWorker::spawn(self.repaint_context.clone()) {
+                    Ok(worker) => Some(worker),
+                    Err(error) => {
+                        self.fail_cad_field_ready_queue(error);
+                        return;
+                    }
+                };
+        }
+        let request_id = field.request_id.clone();
+        let request = CadFieldReadyWorkRequest {
+            field,
+            identity: cad_field_ready::CadFieldReadyIdentity {
+                run_id: pending.run_id.clone(),
+                case_revision_id,
+            },
+        };
+        let Some(worker) = self.cad_field_ready_worker.as_ref() else {
+            self.fail_cad_field_ready_queue(
+                "CAD field preparation worker is unavailable.".into(),
+            );
+            return;
+        };
+        if worker.request_tx.send(request).is_err() {
+            self.fail_cad_field_ready_queue(
+                "CAD field preparation worker stopped.".into(),
+            );
+            return;
+        }
+        self.cad_field_ready_pending = Some(PendingCadFieldReady {
+            request_id: request_id.clone(),
+            started_at: std::time::Instant::now(),
+        });
+        self.engine_status = format!(
+            "◐ Preparing immutable field package · {}",
+            short_id(&request_id)
+        );
+        self.project_notice = Some((
+            "Prediction completed. Encoding the immutable field package off the UI thread before recording the run."
+                .into(),
+            false,
+        ));
+    }
+
+    fn fail_cad_field_ready_queue(&mut self, error: String) {
+        self.cad_field_ready_pending = None;
+        if let Some(case) = self.cad.as_mut() {
+            case.pending = false;
+            case.pending_request_id = None;
+            case.pending_run = None;
+            case.workflow.stage = if case.workflow.ready() {
+                engineering::CaseStage::Ready
+            } else {
+                engineering::CaseStage::Setup
+            };
+        }
+        self.project_notice = Some((
+            format!(
+                "Prediction completed, but immutable run persistence failed and the transient result was discarded: {error}"
+            ),
+            true,
+        ));
+    }
+
+    fn handle_cad_field_ready_results(&mut self) {
+        let completed: Vec<CadFieldReadyWorkResult> = self
+            .cad_field_ready_worker
+            .as_ref()
+            .map(|worker| worker.result_rx.try_iter().collect())
+            .unwrap_or_default();
+        for completed in completed {
+            let is_current = self
+                .cad_field_ready_pending
+                .as_ref()
+                .is_some_and(|pending| pending.request_id == completed.request_id)
+                && self.cad.as_ref().is_some_and(|case| {
+                    case.pending_run
+                        .as_ref()
+                        .is_some_and(|pending| pending.request_id == completed.request_id)
+                });
+            if !is_current {
+                continue;
+            }
+            self.cad_field_ready_pending = None;
+            let ready = match completed.outcome {
+                Ok(ready) => ready,
+                Err(error) => {
+                    self.fail_cad_field_ready_queue(error);
+                    continue;
+                }
+            };
+            match retain_after_persistence(ready, |package| {
+                self.persist_prepared_external_flow_run(package)
+            }) {
+                Ok((persisted_run_id, package)) => {
+                    self.install_prepared_cad_field(persisted_run_id, package);
+                }
+                Err(error) => {
+                    self.fail_cad_field_ready_queue(error);
+                }
+            }
+        }
+    }
+
+    fn install_prepared_cad_field(
+        &mut self,
+        persisted_run_id: String,
+        ready: cad_field_ready::CadFieldReady,
+    ) {
+        self.invalidate_cad_section();
+        if !ready.particles.is_empty() {
+            self.particles = ready.particles;
+        }
+        if let Some((vol, dims)) = ready.volume_data {
+            let (lo, hi) = calibrate_cad_volume_density(&vol);
+            // Keep wake filaments subordinate to the Cp shell.
+            self.density_lo = lo.clamp(0.28, 0.55);
+            self.density_hi = hi.clamp(self.density_lo + 0.15, 0.92);
+            self.volume_data = std::sync::Arc::new(vol);
+            self.volume_dims = dims;
+            self.volume_version = self.volume_version.wrapping_add(1);
+        }
+        let shape = [3usize, ready.n, ready.n, ready.n];
+        if let Some((q_vol, q_dims)) = flow::q_criterion_volume(&shape, &ready.velocity) {
+            self.q_volume_data = std::sync::Arc::new(q_vol);
+            self.q_volume_dims = q_dims;
+            self.volume_version = self.volume_version.wrapping_add(1);
+        }
+        self.insights3d = ready.insights;
+        self.cad_version = self.cad_version.wrapping_add(1);
+        let surf = gpu::SurfaceData {
+            mask: std::sync::Arc::new(ready.surface_mask_u8),
+            pressure: std::sync::Arc::new(ready.surface_cp_u8),
+            dims: [ready.n as u32; 3],
+            mask_version: self.cad_version,
+            pressure_version: self.cad_version,
+        };
+        let n = ready.n;
+        let reynolds = ready.reynolds;
+        let horizon = ready.horizon;
+        if let Some(c) = &mut self.cad {
+            c.mask = std::sync::Arc::new(ready.mask);
+            c.mask_bounds = ready.mask_bounds;
+            c.surf = Some(surf);
+            c.surf_mask_source = Some(c.mask.clone());
+            c.steps = ready.horizon;
+            c.velocity = ready.velocity;
+            c.pressure = ready.pressure;
+            c.cp = ready.cp;
+            c.traction = ready.traction;
+            c.result_grid = ready.n;
+            c.dt_frame = ready.dt_frame;
+            c.pending = false;
+            c.pending_request_id = None;
+            c.pending_run = None;
+            c.playback.reset();
+            c.active_run_id = Some(persisted_run_id);
+            c.workflow.stage = engineering::CaseStage::Results;
+            c.workflow.parent_run_id = c.active_run_id.clone();
+            c.workflow.result = Some(ready.engineering_result);
+        }
+        self.probe3d = None;
+        // Fluent-style default stack: opaque Cp + streamlines. Q iso is optional
+        // because it otherwise fogs the body on a 64³ Brinkman field.
+        self.surface_on = true;
+        self.streamlines = true;
+        self.q_iso_on = false;
+        self.volumetric = true;
+        self.render_volume = false;
+        // Default Case/sandbox state enables an X mid-plane clip. A fitted body
+        // often sits entirely upstream of x=0, so that clip erases the solid and
+        // the wake and leaves a black Results canvas.
+        self.slice = [false, false, false];
+        self.shadows = false;
+        // Three-quarter station + fit so a flat 64³ brick is not an edge-on speck.
+        self.view_snap = Some(viewport::StandardView::Iso);
+        self.view_fit = true;
+        self.nav = Nav::Results;
+        let horizon_span = self
+            .cad
+            .as_ref()
+            .map(|case| case.workflow.model_max_steps.max(case.steps).max(1))
+            .unwrap_or(horizon.max(1));
+        self.engine_status = format!(
+            "● Engineering result {}³ · Re {:.0} · horizon step {} of {}",
+            n, reynolds, horizon, horizon_span
+        );
+        self.engine_ok = true;
+        let notice = if self.q_volume_data.is_empty() {
+            "Immutable run recorded. Body surface and model streamlines are ready for review."
+        } else {
+            "Immutable run recorded. Body surface and model streamlines are on; Q iso is available under Layers."
+        };
+        self.project_notice = Some((notice.into(), false));
+    }
+
+    fn persist_prepared_external_flow_run(
+        &mut self,
+        ready: &cad_field_ready::CadFieldReady,
+    ) -> Result<String, String> {
         self.project_write_access("Recording the completed immutable run")?;
         let case = self
             .cad
@@ -3596,11 +4005,11 @@ impl ReynApp {
         let pending = case
             .pending_run
             .clone()
-            .filter(|pending| pending.request_id == field.request_id)
+            .filter(|pending| pending.request_id == ready.request_id)
             .ok_or_else(|| {
                 format!(
                     "CAD result request {} does not match the submitted run contract",
-                    field.request_id
+                    ready.request_id
                 )
             })?;
         let workflow = pending.workflow.clone();
@@ -3610,84 +4019,41 @@ impl ReynApp {
             .case_revision_id
             .clone()
             .ok_or_else(|| "active case revision missing".to_string())?;
+        if case_revision_id != ready.case_revision_id || pending.run_id != ready.run_id {
+            return Err(
+                "Prepared CAD field package identity does not match the pending run.".into(),
+            );
+        }
         let run_id = pending.run_id.clone();
-        let field_bytes =
-            engineering::encode_engineering_field(&engineering::EngineeringFieldBlob {
-                n: field.n,
-                velocity: field.vel.clone(),
-                pressure_pa: field.pressure.clone(),
-                mask: field.mask.clone(),
-                cp: field.cp.clone(),
-                traction_pa: field.traction.clone(),
-            })?;
-        let field_sha256 = format!("{:x}", Sha256::digest(&field_bytes));
-        self.add_project_content(
-            "Recording the completed immutable run",
-            field_bytes,
+        let field_sha256 = ready.field.digest().to_owned();
+        let result_sha256 = ready.result.digest().to_owned();
+        self.project_write_access("Recording the completed immutable run")?;
+        self.project.add_digested_content(
+            ready.field.clone(),
             "application/vnd.reyn.engineering-field.f32le",
-            &field_sha256,
-        )?;
-        let result_json = serde_json::json!({
-            "schema": engineering::ENGINEERING_RESULT_SCHEMA,
-            "field_schema": engineering::ENGINEERING_FIELD_SCHEMA,
-            "field_sha256": field_sha256.clone(),
-            "submitted_request_id": field.request_id,
-            "run_id": run_id,
-            "case_revision_id": case_revision_id,
-            "method": field.load_method,
-            "grid": field.n,
-            "horizon": field.horizon,
-            "reynolds": field.reynolds,
-            "solver_characteristic_length": field.characteristic_length_solver,
-            "solver_dt": field.solver_dt,
-            "solver_stride": field.solver_stride,
-            "warmup_steps": field.warmup_steps,
-            "dt_frame": field.dt_frame,
-            "cp": {
-                "minimum": field.cp.iter().copied().fold(f32::INFINITY, f32::min),
-                "maximum": field.cp.iter().copied().fold(f32::NEG_INFINITY, f32::max),
-                "source": "derived_from_recovered_pressure",
-            },
-            "force_coefficients": field.force_coefficients,
-            "moment_coefficients": field.moment_coefficients,
-            "force_newtons": field.force_newtons,
-            "moment_newton_meters": field.moment_newton_meters,
-            "moment_reference": "diffuse_surface_area_centroid",
-            "surface_area_m2": field.surface_area_m2,
-            "pressure_force_fraction": field.pressure_force_fraction,
-            "load_hotspot_m": field.load_hotspot,
-            "suction_hotspot_m": field.suction_hotspot,
-            "divergence_rms": field.divergence_rms,
-            "wake_deficit_peak": field.wake_deficit_peak,
-            "wake_deficit_mean": field.wake_deficit_mean,
-            "warnings": field.warnings,
-        });
-        let result_bytes =
-            serde_json::to_vec_pretty(&result_json).map_err(|error| error.to_string())?;
-        let result_sha256 = format!("{:x}", Sha256::digest(&result_bytes));
-        self.add_project_content(
-            "Recording the completed immutable run",
-            result_bytes,
+        );
+        self.project.add_digested_content(
+            ready.result.clone(),
             "application/vnd.reyn.engineering-result+json",
-            &result_sha256,
-        )?;
-        let scalar = |key: &str, value: f32, units: &str| project::ScalarOutput {
+        );
+        let scalar = |key: &str, value: f64, units: &str| project::ScalarOutput {
             key: key.into(),
-            value: value as f64,
+            value,
             units: units.into(),
             abs_tolerance: 1e-6,
         };
-        // divergence_rms stays in the engineering-result JSON for developer
-        // forensics; it is not a customer scalar (variant comparison / Results).
+        let result = &ready.engineering_result;
         let scalar_outputs = vec![
-            scalar("force_coefficient_x", field.force_coefficients[0], "1"),
-            scalar("force_coefficient_y", field.force_coefficients[1], "1"),
-            scalar("force_coefficient_z", field.force_coefficients[2], "1"),
-            scalar("moment_coefficient_x", field.moment_coefficients[0], "1"),
-            scalar("moment_coefficient_y", field.moment_coefficients[1], "1"),
-            scalar("moment_coefficient_z", field.moment_coefficients[2], "1"),
-            scalar("wake_deficit_peak", field.wake_deficit_peak, "1"),
-            scalar("wake_deficit_mean", field.wake_deficit_mean, "1"),
+            scalar("force_coefficient_x", result.force_coefficients[0], "1"),
+            scalar("force_coefficient_y", result.force_coefficients[1], "1"),
+            scalar("force_coefficient_z", result.force_coefficients[2], "1"),
+            scalar("moment_coefficient_x", result.moment_coefficients[0], "1"),
+            scalar("moment_coefficient_y", result.moment_coefficients[1], "1"),
+            scalar("moment_coefficient_z", result.moment_coefficients[2], "1"),
+            scalar("cp_min", result.cp_min, "1"),
+            scalar("cp_max", result.cp_max, "1"),
+            scalar("wake_deficit_peak", result.wake_deficit_peak, "1"),
+            scalar("wake_deficit_mean", result.wake_deficit_mean, "1"),
         ];
         let parent_run_id = pending.parent_run_id.clone().or(active_run_id);
         let parent_run = parent_run_id.as_deref().and_then(|parent_id| {
@@ -3707,21 +4073,19 @@ impl ReynApp {
         let mut manifest = pending.manifest.clone();
         manifest.runtime_ms = runtime_ms;
         manifest.stop_reason = "succeeded".into();
-        manifest.warnings.extend(field.warnings.clone());
+        manifest.warnings.extend(result.warnings.clone());
         manifest.output_sha256 = vec![result_sha256.clone(), field_sha256];
         manifest.scalar_outputs = scalar_outputs;
         if let Some(parent) = &parent_run {
             manifest.compare_scalars_against(parent);
         }
-        let cp_min = field.cp.iter().copied().fold(f32::INFINITY, f32::min);
-        let cp_max = field.cp.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let calibrated_views = vec![
             project::CalibratedView {
                 view_id: format!("view-{run_id}-cp"),
                 quantity: "pressure coefficient Cp".into(),
                 units: "1".into(),
-                scale_min: cp_min.min(cp_max - 1e-6) as f64,
-                scale_max: cp_max.max(cp_min + 1e-6) as f64,
+                scale_min: result.cp_min.min(result.cp_max - 1e-6),
+                scale_max: result.cp_max.max(result.cp_min + 1e-6),
                 source_class: project::EvidenceSourceClass::Derived,
                 method: "Cp=(p_recovered-p_inf)/q_inf".into(),
             },
@@ -3751,14 +4115,12 @@ impl ReynApp {
             created_utc_unix: now_utc_unix(),
             source_class: project::EvidenceSourceClass::Derived,
             media_type: "application/vnd.reyn.engineering-result+json".into(),
-            byte_size: serde_json::to_vec(&result_json)
-                .map_err(|error| error.to_string())?
-                .len() as u64,
+            byte_size: ready.result.len() as u64,
             content_sha256: result_sha256,
             derivation_method: Some(engineering::SURFACE_LOAD_METHOD.into()),
             derivation_version: Some("1".into()),
-            warnings: field.warnings.clone(),
-            metadata: result_json,
+            warnings: result.warnings.clone(),
+            metadata: ready.result_json.clone(),
             calibrated_views,
         };
         let case_id = workflow.case_id;
@@ -3828,6 +4190,7 @@ impl ReynApp {
 
     fn controls_engineering_case(&mut self, ui: &mut egui::Ui) {
         let model_inventory = self.models.clone();
+        let model_inventory_state = self.model_inventory_state.clone();
         let mut waiver_draft = std::mem::take(&mut self.waiver_draft);
         let mut waiver_code = self.waiver_code.take();
         let read_only = self.project.availability().is_read_only_evidence();
@@ -3860,17 +4223,26 @@ impl ReynApp {
                 );
             });
             ui.add_space(10.0);
-            if ui
+            let import = ui
                 .add_enabled(!read_only, egui::Button::new("Import Geometry…"))
                 .on_disabled_hover_text(
                     "Geometry import is blocked while the project is in read-only evidence mode.",
+                );
+            import.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Button,
+                    import.enabled(),
+                    "Import geometry for external-flow case",
                 )
-                .clicked()
+            });
+            if import.clicked()
             {
                 self.import_cad();
             }
             return;
         }
+        let mut open_model_library = false;
+        let mut retry_model_inventory = false;
         let undo_reason = self.case_history_gate_reason(CaseHistoryAction::Undo);
         let redo_reason = self.case_history_gate_reason(CaseHistoryAction::Redo);
         let mut history_action = None;
@@ -3918,6 +4290,8 @@ impl ReynApp {
         self.engineering_notice(ui);
         let had_unsaved_work = self.has_unsaved_project_work();
         let mut schedule_orientation_autosave = false;
+        let focus_stage = self.study_focus_stage.take();
+        let mut requested_study_stage = None;
         let orientation_pending = self
             .orientation_pending
             .as_ref()
@@ -3931,6 +4305,48 @@ impl ReynApp {
         // stage-based fraction (not wall-clock %). Show stage + elapsed + Cancel.
         // Rendered before `ui.disable()` so Cancel stays live.
         let mut cancel_run = false;
+        let outline_blockers = case.workflow.readiness_blockers();
+        card(ui, |ui| {
+            ui.label(caps("Study outline"));
+            for stage in [
+                engineering::ReadinessStage::Geometry,
+                engineering::ReadinessStage::QualifiedModel,
+                engineering::ReadinessStage::FlowConditions,
+                engineering::ReadinessStage::ReviewFocus,
+                engineering::ReadinessStage::RunReadiness,
+            ] {
+                let count = outline_blockers
+                    .iter()
+                    .filter(|blocker| blocker.stage == stage)
+                    .count();
+                let a11y_name = if count == 0 {
+                    format!("Study stage {} · ready", stage.label())
+                } else {
+                    format!(
+                        "Study stage {} · {} blocker{}",
+                        stage.label(),
+                        count,
+                        if count == 1 { "" } else { "s" }
+                    )
+                };
+                let label = if count == 0 {
+                    format!("✓  {}", stage.label())
+                } else {
+                    format!("!  {} · {count}", stage.label())
+                };
+                let response = ui.add_sized(
+                    [ui.available_width(), 28.0],
+                    egui::Button::new(label).selected(focus_stage == Some(stage)),
+                );
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::Button, response.enabled(), &a11y_name)
+                });
+                if response.clicked() {
+                    requested_study_stage = Some(stage);
+                }
+            }
+        });
+        ui.add_space(10.0);
         if case.pending {
             let elapsed = case
                 .pending_run
@@ -4004,12 +4420,17 @@ impl ReynApp {
                     diag(ui, "Request", &short_hash(request_id), TEXT_MUTE);
                 }
                 ui.add_space(6.0);
-                cancel_run = ui
-                    .button("Cancel run")
-                    .on_hover_text(
-                        "Cancel this run, persist the attempt as cancelled, terminate the blocking sidecar, and start a fresh engine for retry. No result evidence is created.",
+                let cancel = ui.button("Cancel run").on_hover_text(
+                    "Cancel this run, persist the attempt as cancelled, terminate the blocking sidecar, and start a fresh engine for retry. No result evidence is created.",
+                );
+                cancel.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Button,
+                        cancel.enabled(),
+                        "Cancel in-flight external-flow run",
                     )
-                    .clicked();
+                });
+                cancel_run = cancel.clicked();
             });
             ui.add_space(10.0);
         }
@@ -4061,6 +4482,11 @@ impl ReynApp {
         let mut changed = false;
         let mut template_view_changed = false;
         card(ui, |ui| {
+            if focus_stage == Some(engineering::ReadinessStage::Geometry) {
+                let anchor = ui.label("");
+                anchor.request_focus();
+                ui.scroll_to_rect(anchor.rect, Some(egui::Align::Center));
+            }
             ui.label(caps("Setup gate"));
             let units_known =
                 case.workflow.operating.length_unit != engineering::LengthUnit::Unknown;
@@ -4085,7 +4511,9 @@ impl ReynApp {
                 )
             };
             alert_line(ui, color, glyph, message);
-            egui::ComboBox::from_id_salt("engineering.length-unit")
+            let length_unit_label = a11y_caption(ui, "Geometry length unit");
+            let previous_unit = case.workflow.operating.length_unit;
+            let length_unit_combo = egui::ComboBox::from_id_salt("engineering.length-unit")
                 .selected_text(case.workflow.operating.length_unit.label())
                 .width(ui.available_width())
                 .show_ui(ui, |ui| {
@@ -4099,12 +4527,58 @@ impl ReynApp {
                             .changed();
                     }
                 });
+            length_unit_combo
+                .response
+                .labelled_by(length_unit_label.id);
+            if case.workflow.operating.length_unit != previous_unit
+                && case
+                    .workflow
+                    .operating
+                    .retarget_velocity_to_qualified_reynolds()
+            {
+                changed = true;
+                self.project_notice = Some((
+                    format!(
+                        "Free-stream set for Re ≈ {:.0} inside the qualified envelope.",
+                        engineering::QUALIFIED_REYNOLDS_TARGET
+                    ),
+                    false,
+                ));
+            }
             changed |= ui
                 .checkbox(
                     &mut case.workflow.preflight.transform_approved,
                     "Approve units, orientation, scale, and solver placement",
                 )
                 .changed();
+            let re_out_of_band = case.workflow.operating.length_unit
+                != engineering::LengthUnit::Unknown
+                && !case.workflow.operating.reynolds_in_qualified_envelope();
+            if re_out_of_band
+                && ui
+                    .add_sized(
+                        [ui.available_width(), 28.0],
+                        egui::Button::new(
+                            RichText::new(format!(
+                                "Set free-stream for Re ≈ {:.0}",
+                                engineering::QUALIFIED_REYNOLDS_TARGET
+                            ))
+                            .text_style(caption()),
+                        ),
+                    )
+                    .on_hover_text(
+                        "Keeps density and viscosity; only adjusts free-stream so Reynolds lands mid-envelope.",
+                    )
+                    .clicked()
+            {
+                if case
+                    .workflow
+                    .operating
+                    .retarget_velocity_to_qualified_reynolds()
+                {
+                    changed = true;
+                }
+            }
         });
         ui.add_space(8.0);
         inspector_group(
@@ -4540,6 +5014,8 @@ impl ReynApp {
                         name: String::new(),
                         candidate_id: candidate_id.clone(),
                         role: "unassigned".into(),
+                        identity_kind: "heuristic_index".into(),
+                        stable_face_id: candidate_id.clone(),
                     });
                 let mut name = existing.name;
                 let mut role = existing.role;
@@ -4574,6 +5050,8 @@ impl ReynApp {
                             .named_regions
                             .push(engineering::NamedRegionAssignment {
                                 name,
+                                stable_face_id: candidate_id.clone(),
+                                identity_kind: "heuristic_index".into(),
                                 candidate_id,
                                 role,
                             });
@@ -4593,97 +5071,172 @@ impl ReynApp {
         });
         ui.add_space(10.0);
         card(ui, |ui| {
+            if focus_stage == Some(engineering::ReadinessStage::QualifiedModel) {
+                let anchor = ui.label("");
+                anchor.request_focus();
+                ui.scroll_to_rect(anchor.rect, Some(egui::Align::Center));
+            }
             ui.label(caps("Operating point"));
             ui.label(
                 RichText::new("Qualified model")
                     .text_style(caption())
                     .color(TEXT_MUTE),
             );
-            egui::ComboBox::from_id_salt("engineering.model")
-                .selected_text(&case.workflow.model_id)
-                .width(ui.available_width())
-                .show_ui(ui, |ui| {
-                    for model in model_inventory.iter().filter(|model| {
-                        model.dimension == 3
-                            && model.grid as usize == case.workflow.preflight.target_grid
-                            && model.in_channels > model.out_channels
-                            && model.out_channels == 3
-                            && model.scenario == "obstacle"
-                    }) {
-                        if ui
-                            .selectable_value(
-                                &mut case.workflow.model_id,
-                                model.id.clone(),
-                                &model.name,
-                            )
-                            .changed()
+            let target_grid = case.workflow.preflight.target_grid;
+            let qualified = model_inventory
+                .iter()
+                .filter(|model| engine::is_qualified_external_flow_model(model, target_grid))
+                .collect::<Vec<_>>();
+            match model_selector_mode(
+                &model_inventory_state,
+                &model_inventory,
+                &case.workflow.model_id,
+                target_grid,
+            ) {
+                ModelSelectorMode::Loading => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            RichText::new("Checking installed models…")
+                                .text_style(caption())
+                                .color(TEXT_MUTE),
+                        );
+                    });
+                }
+                ModelSelectorMode::Failed(error) => {
+                    ui.label(
+                        RichText::new("Model inventory is unavailable")
+                            .text_style(caption())
+                            .color(WARN),
+                    );
+                    ui.label(RichText::new(error).text_style(caption()).color(TEXT_MUTE));
+                    if ui.button("Retry model check").clicked() {
+                        retry_model_inventory = true;
+                    }
+                }
+                ModelSelectorMode::StoredModelMissing(model_id) => {
+                    ui.label(
+                        RichText::new(format!("Stored model unavailable: {model_id}"))
+                            .text_style(caption())
+                            .color(WARN),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "The case keeps the recorded model identity, but running is blocked until that exact qualified bundle is installed or the draft is explicitly rebound.",
+                        )
+                        .text_style(caption())
+                        .color(TEXT_MUTE),
+                    );
+                    if ui.button("Open Model Library").clicked() {
+                        open_model_library = true;
+                    }
+                }
+                ModelSelectorMode::NoneQualified => {
+                    ui.label(
+                        RichText::new("No qualified 3D model installed")
+                            .text_style(caption())
+                            .color(WARN),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "Geometry review remains available. Reyn will not substitute the bundled 2D model or invent a compatible option.",
+                        )
+                        .text_style(caption())
+                        .color(TEXT_MUTE),
+                    );
+                    if ui.button("Open Model Library").clicked() {
+                        open_model_library = true;
+                    }
+                }
+                ModelSelectorMode::OneQualified(model_id) => {
+                    if let Some(model) = qualified.iter().find(|model| model.id == model_id) {
+                        if case.workflow.model_id.trim().is_empty() && !read_only {
+                            bind_external_flow_model(case, model);
+                            identity_changed = true;
+                            changed = true;
+                        }
+                        ui.label(RichText::new(&model.name).color(TEXT));
+                        ui.label(
+                            RichText::new("Only qualified model for this geometry")
+                                .text_style(caption())
+                                .color(TEXT_MUTE),
+                        );
+                    }
+                }
+                ModelSelectorMode::MultipleQualified => {
+                    let mut selected_id = case.workflow.model_id.clone();
+                    let selected_text = qualified
+                        .iter()
+                        .find(|model| model.id == selected_id)
+                        .map(|model| model.name.as_str())
+                        .unwrap_or("Select a qualified model…");
+                    let response = egui::ComboBox::from_id_salt("engineering.model")
+                        .selected_text(selected_text)
+                        .width(ui.available_width())
+                        .show_ui(ui, |ui| {
+                            for model in &qualified {
+                                ui.selectable_value(
+                                    &mut selected_id,
+                                    model.id.clone(),
+                                    &model.name,
+                                );
+                            }
+                        });
+                    if response.response.changed() {
+                        if let Some(model) = qualified.iter().find(|model| model.id == selected_id)
                         {
-                            case.model = model.id.clone();
-                            case.workflow.model_sha256 = Some(model.checkpoint_sha256.clone());
-                            case.workflow.model_max_steps = model.max_steps;
-                            case.workflow.model_support = engineering::ModelSupport {
-                                status: model.status.clone(),
-                                dimension: model.dimension,
-                                grid: model.grid,
-                                input_channels: model.in_channels,
-                                output_channels: model.out_channels,
-                                scenario: model.scenario.clone(),
-                                physics_contract: model.physics_contract.clone(),
-                            };
+                            bind_external_flow_model(case, model);
                             // Model hashes are immutable identity, not undo
                             // payload. Rebase draft history at this boundary.
                             identity_changed = true;
                             changed = true;
                         }
                     }
-                });
-            diag(
-                ui,
-                "Model grid",
-                &format!("{}³", case.workflow.model_support.grid),
-                TEXT_DIM,
-            );
-            diag(
-                ui,
-                "Channels",
-                &format!(
-                    "{} → {}",
-                    case.workflow.model_support.input_channels,
-                    case.workflow.model_support.output_channels
-                ),
-                TEXT_DIM,
-            );
-            diag(
-                ui,
-                "Scenario",
-                &case.workflow.model_support.scenario,
-                TEXT_DIM,
-            );
-            diag(
-                ui,
-                "Physics",
-                &case.workflow.model_support.physics_contract,
-                TEXT_DIM,
-            );
-            diag(
-                ui,
-                "Horizon support",
-                &format!("1–{} steps", case.workflow.model_max_steps),
-                TEXT_DIM,
-            );
+                }
+            }
+            if let Some(selected) = qualified
+                .iter()
+                .find(|model| model.id == case.workflow.model_id)
+            {
+                diag(ui, "Model grid", &format!("{}³", selected.grid), TEXT_DIM);
+                diag(
+                    ui,
+                    "Channels",
+                    &format!("{} → {}", selected.in_channels, selected.out_channels),
+                    TEXT_DIM,
+                );
+                diag(ui, "Scenario", &selected.scenario, TEXT_DIM);
+                diag(ui, "Physics", &selected.physics_contract, TEXT_DIM);
+                diag(
+                    ui,
+                    "Qualification",
+                    &selected.qualification_class,
+                    if selected.qualification_class
+                        == engine::MODEL_QUALIFICATION_PRODUCTION
+                    {
+                        SUCCESS
+                    } else {
+                        WARN
+                    },
+                );
+                diag(
+                    ui,
+                    "Horizon support",
+                    &format!("1–{} steps", selected.max_steps),
+                    TEXT_DIM,
+                );
+            }
             ui.separator();
             diag(ui, "Flow direction", "+X · fixed-body contract", TEXT_DIM);
-            ui.label(
-                RichText::new("Reference length")
-                    .text_style(caption())
-                    .color(TEXT_MUTE),
-            );
-            let response = ui.add(
-                egui::DragValue::new(&mut case.workflow.operating.reference_length)
-                    .speed(0.01)
-                    .range(1e-9..=1e9)
-                    .suffix(format!(" {}", case.workflow.operating.length_unit.symbol())),
-            );
+            let reference_length_label = a11y_caption(ui, "Reference length");
+            let response = ui
+                .add(
+                    egui::DragValue::new(&mut case.workflow.operating.reference_length)
+                        .speed(0.01)
+                        .range(1e-9..=1e9)
+                        .suffix(format!(" {}", case.workflow.operating.length_unit.symbol())),
+                )
+                .labelled_by(reference_length_label.id);
             track_case_edit_response(
                 &response,
                 CaseEditTransaction::ReferenceLength,
@@ -4713,7 +5266,118 @@ impl ReynApp {
                     }
                 });
             }
+            ui.add_space(6.0);
+            let moment_origin_label = a11y_caption(ui, "Moment / CG origin");
+            let moment_mode_label = case.workflow.operating.moment_origin_mode.label();
+            let moment_combo = egui::ComboBox::from_id_salt("engineering.moment-origin-mode")
+                .selected_text(moment_mode_label)
+                .width(ui.available_width())
+                .show_ui(ui, |ui| {
+                    for mode in [
+                        engineering::MomentOriginMode::DiffuseSurfaceCentroid,
+                        engineering::MomentOriginMode::SourceFramePoint,
+                    ] {
+                        if ui
+                            .selectable_label(
+                                case.workflow.operating.moment_origin_mode == mode,
+                                mode.label(),
+                            )
+                            .clicked()
+                        {
+                            case.workflow.operating.moment_origin_mode = mode;
+                            changed = true;
+                            changed_transaction = Some(CaseEditTransaction::MomentOrigin);
+                        }
+                    }
+                });
+            moment_combo.response.labelled_by(moment_origin_label.id);
+            if case.workflow.operating.moment_origin_mode
+                == engineering::MomentOriginMode::SourceFramePoint
+            {
+                let origin_label = a11y_caption(ui, "Source-frame origin (geometry units)");
+                ui.horizontal(|ui| {
+                    for (axis, value) in case
+                        .workflow
+                        .operating
+                        .moment_origin_source
+                        .iter_mut()
+                        .enumerate()
+                    {
+                        let response = ui
+                            .add(
+                                egui::DragValue::new(value)
+                                    .speed(0.01)
+                                    .prefix(format!("{} ", ["X", "Y", "Z"][axis]))
+                                    .suffix(format!(
+                                        " {}",
+                                        case.workflow.operating.length_unit.symbol()
+                                    )),
+                            )
+                            .labelled_by(origin_label.id);
+                        track_case_edit_response(
+                            &response,
+                            CaseEditTransaction::MomentOrigin,
+                            &mut changed,
+                            &mut changed_transaction,
+                            &mut active_transaction,
+                        );
+                    }
+                });
+            }
+            let aero_area_label = a11y_caption(ui, "Aero reference area (optional)");
+            let mut use_reference_area = case.workflow.operating.reference_area_m2.is_some();
+            let area_toggle = ui
+                .checkbox(&mut use_reference_area, "Override coefficient area")
+                .labelled_by(aero_area_label.id);
+            if area_toggle.changed() {
+                case.workflow.operating.reference_area_m2 = if use_reference_area {
+                    Some(
+                        case.workflow
+                            .operating
+                            .reference_area_m2
+                            .filter(|area| *area > 0.0)
+                            .unwrap_or(1.0),
+                    )
+                } else {
+                    None
+                };
+                changed = true;
+                changed_transaction = Some(CaseEditTransaction::ReferenceArea);
+            }
+            if let Some(area) = case.workflow.operating.reference_area_m2.as_mut() {
+                let response = ui
+                    .add(
+                        egui::DragValue::new(area)
+                            .speed(0.001)
+                            .range(1e-12..=1e9)
+                            .suffix(" m²"),
+                    )
+                    .labelled_by(aero_area_label.id);
+                track_case_edit_response(
+                    &response,
+                    CaseEditTransaction::ReferenceArea,
+                    &mut changed,
+                    &mut changed_transaction,
+                    &mut active_transaction,
+                );
+                ui.label(
+                    RichText::new("Coefficients use q∞·A and q∞·A·L when set; dimensional loads stay unchanged.")
+                        .text_style(caption())
+                        .color(TEXT_MUTE),
+                );
+            } else {
+                ui.label(
+                    RichText::new("Coefficients default to q∞·L² and q∞·L³.")
+                        .text_style(caption())
+                        .color(TEXT_MUTE),
+                );
+            }
             ui.separator();
+            if focus_stage == Some(engineering::ReadinessStage::FlowConditions) {
+                let anchor = ui.label("");
+                anchor.request_focus();
+                ui.scroll_to_rect(anchor.rect, Some(egui::Align::Center));
+            }
             ui.label(caps("Starting defaults"));
             ui.add_space(4.0);
             ui.label(
@@ -5060,8 +5724,47 @@ impl ReynApp {
             );
         });
         ui.add_space(10.0);
-        let issues = case.workflow.readiness_issues();
-        if issues.is_empty() && case.workflow.model_support.status == "clean" {
+        card(ui, |ui| {
+            if focus_stage == Some(engineering::ReadinessStage::ReviewFocus) {
+                let anchor = ui.label("");
+                anchor.request_focus();
+                ui.scroll_to_rect(anchor.rect, Some(egui::Align::Center));
+            }
+            ui.label(caps("Review Focus"));
+            ui.label(
+                RichText::new(
+                    "Choose the supported quantity Results and variant comparison should lead with. This does not change solver convergence or the computed field.",
+                )
+                .text_style(caption())
+                .color(TEXT_MUTE),
+            );
+            let previous = case.workflow.review_focus.primary;
+            egui::ComboBox::from_id_salt("engineering.review-focus")
+                .selected_text(case.workflow.review_focus.primary.label())
+                .width(ui.available_width())
+                .show_ui(ui, |ui| {
+                    for quantity in engineering::ReviewQuantity::ALL {
+                        ui.selectable_value(
+                            &mut case.workflow.review_focus.primary,
+                            quantity,
+                            quantity.label(),
+                        );
+                    }
+                });
+            if case.workflow.review_focus.primary != previous {
+                case.workflow.review_focus.schema_version =
+                    engineering::REVIEW_FOCUS_SCHEMA_VERSION;
+                changed = true;
+            }
+        });
+        ui.add_space(10.0);
+        if focus_stage == Some(engineering::ReadinessStage::RunReadiness) {
+            let anchor = ui.label("");
+            anchor.request_focus();
+            ui.scroll_to_rect(anchor.rect, Some(egui::Align::Center));
+        }
+        let blockers = case.workflow.readiness_blockers();
+        if blockers.is_empty() && case.workflow.model_support.status == "clean" {
             case.workflow.stage = engineering::CaseStage::Ready;
             ui.label(
                 RichText::new("READY · CONTRACT WITHIN QUALIFIED ENVELOPE")
@@ -5069,7 +5772,7 @@ impl ReynApp {
                     .text_style(mono_s())
                     .color(SUCCESS),
             );
-        } else if issues.is_empty() {
+        } else if blockers.is_empty() {
             case.workflow.stage = engineering::CaseStage::Ready;
             ui.label(
                 RichText::new("READY WITH MODEL METADATA REVIEW")
@@ -5086,17 +5789,29 @@ impl ReynApp {
             );
         } else {
             ui.label(
-                RichText::new(format!("{} BLOCKER(S)", issues.len()))
+                RichText::new(format!("{} BLOCKER(S)", blockers.len()))
                     .strong()
                     .text_style(mono_s())
                     .color(WARN),
             );
+            for blocker in blockers.iter().take(8) {
+                if ui
+                    .button(format!("{} · {}", blocker.stage.label(), blocker.message))
+                    .clicked()
+                {
+                    requested_study_stage = Some(blocker.stage);
+                }
+            }
             for issue in case
                 .workflow
                 .preflight
                 .support_issues()
                 .into_iter()
-                .filter(|issue| issues.contains(&issue.message))
+                .filter(|issue| {
+                    blockers
+                        .iter()
+                        .any(|blocker| blocker.message == issue.message)
+                })
                 .take(6)
             {
                 ui.horizontal_wrapped(|ui| {
@@ -5138,7 +5853,27 @@ impl ReynApp {
             self.orientation_draft,
             self.orientation_pending.as_ref(),
         );
-        let ready = case.workflow.ready() && !running && orientation_run_gate.is_none();
+        let local_model_ready = matches!(model_inventory_state, ModelInventoryState::Ready)
+            && model_inventory.iter().any(|model| {
+                model.id == case.workflow.model_id
+                    && engine::is_qualified_external_flow_model(
+                        model,
+                        case.workflow.preflight.target_grid,
+                    )
+            });
+        let model_run_gate = (!local_model_ready).then_some(match &model_inventory_state {
+            ModelInventoryState::Loading => "Installed models are still being checked.",
+            ModelInventoryState::Failed(_) => {
+                "The installed-model inventory is unavailable. Retry the model check."
+            }
+            ModelInventoryState::Ready => {
+                "The case's qualified model is not installed or no longer matches this geometry."
+            }
+        });
+        let ready = case.workflow.ready()
+            && local_model_ready
+            && !running
+            && orientation_run_gate.is_none();
         let mut run = ui.add_enabled(
             ready,
             egui::Button::new(
@@ -5151,7 +5886,22 @@ impl ReynApp {
             )
             .fill(EMBER),
         );
+        run.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Button,
+                run.enabled(),
+                if running {
+                    "External-flow analysis running"
+                } else if ready {
+                    "Run qualified external-flow analysis"
+                } else {
+                    "Run qualified analysis unavailable until study gates clear"
+                },
+            )
+        });
         if let Some(reason) = &orientation_run_gate {
+            run = run.on_disabled_hover_text(reason);
+        } else if let Some(reason) = model_run_gate {
             run = run.on_disabled_hover_text(reason);
         }
         let run_requested = run.clicked();
@@ -5169,6 +5919,7 @@ impl ReynApp {
                 );
             }
             self.invalidate_active_case_result();
+            self.refresh_geometry_setup_status();
             self.project_notice = Some((
                 "Case contract changed. Completed runs remain immutable; the draft requires a new run."
                     .into(),
@@ -5196,6 +5947,26 @@ impl ReynApp {
         if schedule_orientation_autosave {
             self.schedule_autosave_from_now();
         }
+        if let Some(stage) = requested_study_stage {
+            self.study_focus_stage = Some(stage);
+        }
+        if open_model_library {
+            self.nav = Nav::Models;
+        }
+        if retry_model_inventory {
+            self.library.busy = true;
+            self.model_inventory_state = ModelInventoryState::Loading;
+            match self.engine.send(engine::Cmd::ListModels) {
+                Ok(request) => self.library_pending_request = Some(request),
+                Err(error) => {
+                    self.library.busy = false;
+                    self.library_pending_request = None;
+                    self.model_inventory_state = ModelInventoryState::Failed(format!(
+                        "The model inventory request could not be started: {error}"
+                    ));
+                }
+            }
+        }
     }
 
     fn controls_engineering_results(&mut self, ui: &mut egui::Ui) {
@@ -5219,7 +5990,8 @@ impl ReynApp {
                 .iter()
                 .map(|scalar| (scalar.key.clone(), scalar.clone()))
                 .collect();
-            let rows = current
+            let focus_key = active.workflow.review_focus.primary.scalar_key();
+            let mut rows = current
                 .manifest()
                 .scalar_outputs
                 .iter()
@@ -5237,6 +6009,7 @@ impl ReynApp {
                     })
                 })
                 .collect::<Vec<_>>();
+            rows.sort_by_key(|(key, _, _, _)| (key != focus_key, key.clone()));
             Some((
                 parent.run_id().to_owned(),
                 current.run_id().to_owned(),
@@ -5301,6 +6074,30 @@ impl ReynApp {
                 } else {
                     "Supported contract · model metadata review — provenance incomplete, preserved in evidence"
                 },
+            );
+        });
+        ui.add_space(12.0);
+        card(ui, |ui| {
+            ui.label(caps("Review Focus"));
+            ui.label(
+                RichText::new(case.workflow.review_focus.primary.label())
+                    .text_style(body_strong())
+                    .color(GOLD),
+            );
+            ui.label(
+                RichText::new(units::format_value(
+                    case.workflow.review_focus.primary.value(result),
+                    self.settings.value_format(),
+                ))
+                .text_style(mono_s())
+                .color(TEXT),
+            );
+            ui.label(
+                RichText::new(
+                    "Emphasis only · the selected quantity did not control solver convergence.",
+                )
+                .text_style(caption())
+                .color(TEXT_MUTE),
             );
         });
         ui.add_space(12.0);
@@ -5387,9 +6184,13 @@ impl ReynApp {
             );
             let (moment_text, moment_unit) =
                 vector(result.moment_newton_meters, units::Quantity::Moment);
+            let moment_label = match result.moment_origin_mode.as_str() {
+                "source_frame_point" => "Fluid moment · source-frame origin",
+                _ => "Fluid moment · surface centroid",
+            };
             measure_row(
                 ui,
-                "Fluid moment · surface centroid",
+                moment_label,
                 &moment_text,
                 moment_unit,
                 "DERIVED",
@@ -5660,10 +6461,25 @@ impl ReynApp {
                         );
                     });
                 }
+                if ui
+                    .button(RichText::new("Mid-plane Y").text_style(caption()))
+                    .on_hover_text("Clip at Y = 0.5 without changing Fit")
+                    .clicked()
+                {
+                    self.slice = [false, true, false];
+                    self.slice_pos[1] = 0.5;
+                }
             });
             inspector_group(ui, "results-layers", "Layers", true, |ui| {
                 ui.checkbox(&mut self.surface_on, "Cp surface");
-                ui.checkbox(&mut self.render_volume, "Velocity / vorticity volume");
+                ui.checkbox(&mut self.streamlines, "Model streamlines")
+                    .on_hover_text(viewport::MODEL_STREAMLINE_LABEL);
+                ui.checkbox(&mut self.q_iso_on, "Q iso-surface")
+                    .on_hover_text(
+                        "Thin Q-criterion cores when vorticity volume is off. Disabled while the full wake volume is on.",
+                    );
+                ui.checkbox(&mut self.render_volume, "Vorticity volume")
+                    .on_hover_text("Optional full-domain |ω| fog — off by default");
                 ui.checkbox(&mut self.insights_on, "Load and suction hotspots");
             });
         } else {
@@ -7298,7 +8114,35 @@ impl ReynApp {
             exported_sample_moment_newton_meters_wind_axes: exported_moment,
             force_reconciliation_residual_newtons: force_residual,
             moment_reconciliation_residual_newton_meters: moment_residual,
-            moment_reference: "diffuse-surface area centroid in solver/wind axes".into(),
+            moment_reference: if result.moment_origin_mode.is_empty() {
+                operating.moment_origin_mode.label().into()
+            } else {
+                result.moment_origin_mode.clone()
+            },
+            moment_origin_mode: if result.moment_origin_mode.is_empty() {
+                match operating.moment_origin_mode {
+                    engineering::MomentOriginMode::DiffuseSurfaceCentroid => {
+                        "diffuse_surface_centroid".into()
+                    }
+                    engineering::MomentOriginMode::SourceFramePoint => {
+                        "source_frame_point".into()
+                    }
+                }
+            } else {
+                result.moment_origin_mode.clone()
+            },
+            moment_origin_source_m: operating
+                .moment_origin_source_m()
+                .unwrap_or([0.0, 0.0, 0.0]),
+            moment_origin_solver: result.moment_origin_solver,
+            reference_area_m2: result
+                .reference_area_m2
+                .or_else(|| operating.aero_reference_area_m2()),
+            coefficient_reference: if result.coefficient_reference.is_empty() {
+                "q_inf * L_ref^2 ; q_inf * L_ref^3".into()
+            } else {
+                result.coefficient_reference.clone()
+            },
             integrated_surface_area_m2: result.surface_area_m2,
             pressure_force_fraction: result.pressure_force_fraction,
             reconciliation_method:
@@ -7427,12 +8271,124 @@ impl ReynApp {
         self.import_cad_path(path);
     }
 
+    /// Dev/QA hook (REYN_STUDIO_APPROVE_TRANSFORM=1): once geometry is on the
+    /// case and no import is in flight, approve the units/transform gate the
+    /// same way the Setup Gate checkbox does.
+    fn handle_qa_approve_transform(&mut self) {
+        if !self.qa_approve_transform {
+            return;
+        }
+        if self.qa_import_path.is_some() || self.geometry_import_pending.is_some() {
+            return;
+        }
+        {
+            let Some(case) = self.cad.as_mut() else {
+                return;
+            };
+            if case.workflow.preflight.transform_approved {
+                self.qa_approve_transform = false;
+                return;
+            }
+            case.workflow.preflight.transform_approved = true;
+            let _ = case
+                .workflow
+                .operating
+                .retarget_velocity_to_qualified_reynolds();
+        }
+        self.qa_approve_transform = false;
+        self.case_draft_dirty = true;
+        self.refresh_geometry_setup_status();
+        eprintln!("REYN_STUDIO_APPROVE_TRANSFORM applied");
+    }
+
+    fn refresh_geometry_setup_status(&mut self) {
+        let Some(case) = self.cad.as_ref() else {
+            return;
+        };
+        self.engine_status = geometry_setup_engine_status(&case.name, &case.workflow.preflight);
+    }
+
+    /// Dev/QA hook (REYN_STUDIO_RUN_ANALYSIS=1): start the ordinary run once the
+    /// case is ready with a qualified installed model.
+    fn handle_qa_run_analysis(&mut self) {
+        if !self.qa_run_analysis {
+            return;
+        }
+        if self.qa_import_path.is_some()
+            || self.geometry_import_pending.is_some()
+            || self.qa_approve_transform
+        {
+            return;
+        }
+        if self.cad.is_none() {
+            return;
+        }
+        if self
+            .cad
+            .as_ref()
+            .is_some_and(|case| case.pending || case.workflow.result.is_some())
+        {
+            self.qa_run_analysis = false;
+            return;
+        }
+        if !matches!(self.model_inventory_state, ModelInventoryState::Ready) {
+            return;
+        }
+        let grid = self
+            .cad
+            .as_ref()
+            .map(|case| case.workflow.preflight.target_grid)
+            .unwrap_or(0);
+        let needs_bind = self.cad.as_ref().is_some_and(|case| {
+            case.workflow.model_id.trim().is_empty()
+                || case.workflow.model_support.status == "unavailable"
+                || !self.models.iter().any(|model| {
+                    model.id == case.workflow.model_id
+                        && engine::is_qualified_external_flow_model(model, grid)
+                })
+        });
+        if needs_bind {
+            if let Some(model) = self
+                .models
+                .iter()
+                .filter(|model| engine::is_qualified_external_flow_model(model, grid))
+                .find(|model| model.id == self.settings.default_3d_model)
+                .or_else(|| {
+                    self.models
+                        .iter()
+                        .filter(|model| engine::is_qualified_external_flow_model(model, grid))
+                        .max_by_key(|model| model.grid)
+                })
+                .cloned()
+            {
+                if let Some(case) = self.cad.as_mut() {
+                    bind_external_flow_model(case, &model);
+                    eprintln!("REYN_STUDIO_RUN_ANALYSIS bound model {}", model.id);
+                }
+            }
+        }
+        let Some(case) = self.cad.as_ref() else {
+            return;
+        };
+        let grid = case.workflow.preflight.target_grid;
+        let model_id = case.workflow.model_id.clone();
+        let local_model_ready = self.models.iter().any(|model| {
+            model.id == model_id && engine::is_qualified_external_flow_model(model, grid)
+        });
+        if !case.workflow.ready() || !local_model_ready {
+            return;
+        }
+        self.qa_run_analysis = false;
+        eprintln!("REYN_STUDIO_RUN_ANALYSIS starting");
+        self.run_external_flow();
+    }
+
     /// Dev/QA hook (REYN_STUDIO_SHOT=path): once the UI has had a few frames
     /// to settle, request a composited screenshot and write the full window
     /// to the given path. Complements REYN_STUDIO_WINDOW/START_NAV and avoids
     /// depending on OS screen-recording permission during visual audits.
     fn handle_qa_shot(&mut self, ctx: &egui::Context) {
-        const SETTLE_FRAMES: u32 = 20;
+        const SETTLE_FRAMES: u32 = 45;
         let Some(path) = self.qa_shot_path.clone() else {
             return;
         };
@@ -7440,6 +8396,39 @@ impl ReynApp {
         // A queued QA import has to land first, or the capture would show the
         // pre-import screen. The settle window starts after it.
         if self.qa_import_path.is_some() {
+            return;
+        }
+        // STEP/mesh import is async; wait for the worker so the shot shows the
+        // Case Setup viewport with geometry, not the "Importing…" overlay.
+        if self.geometry_import_pending.is_some() {
+            return;
+        }
+        // Optional transform approval must land before the shot, otherwise the
+        // capture still shows the blocked Setup Gate.
+        if self.qa_approve_transform {
+            return;
+        }
+        // Optional analysis run must finish before a Results shot.
+        if self.qa_run_analysis {
+            return;
+        }
+        if let Some(case) = self.cad.as_ref() {
+            if case.pending {
+                return;
+            }
+            if std::env::var("REYN_STUDIO_START_NAV").as_deref() == Ok("results")
+                && case.workflow.result.is_none()
+            {
+                return;
+            }
+            if case.workflow.result.is_some() && self.nav != Nav::Results {
+                self.nav = Nav::Results;
+                return;
+            }
+        }
+        // Wait for Fit / station glides so the shot frames the body, not the
+        // default domain orbit that makes a 64³ brick look like a speck.
+        if self.cam.is_animating() || self.view_fit {
             return;
         }
         self.qa_shot_frames = self.qa_shot_frames.saturating_add(1);
@@ -7801,6 +8790,9 @@ impl ReynApp {
                             self.nav = Nav::Settings;
                             self.settings_ui.category = settings::SettingsCategory::Updates;
                         }
+                    }
+                    MenuCommand::SignOut => {
+                        self.sign_out_requested = true;
                     }
                 },
                 MenuSignal::OpenRecent(path) => self.request_project_action(
@@ -8445,7 +9437,10 @@ impl ReynApp {
                     .and_then(|name| name.to_str())
                     .unwrap_or("not saved");
                 ui.label(
-                    RichText::new(format!("{project_location} · schema v3"))
+                    RichText::new(format!(
+                        "{project_location} · schema v{}",
+                        project::PROJECT_SCHEMA_VERSION
+                    ))
                         .text_style(mono_s())
                         .color(TEXT_MUTE),
                 );
@@ -8810,7 +9805,12 @@ impl ReynApp {
         card(ui, |ui| {
             ui.label(caps("Active document"));
             ui.add_space(8.0);
-            diag(ui, "Schema", "v2 · strict", TEXT);
+            diag(
+                ui,
+                "Schema",
+                &format!("v{} · strict", project::PROJECT_SCHEMA_VERSION),
+                TEXT,
+            );
             diag(ui, "Cases", &summary.cases.to_string(), TEXT_DIM);
             diag(ui, "Immutable runs", &summary.runs.to_string(), BRAND);
             diag(ui, "Evidence links", &summary.evidence.to_string(), GOLD);
@@ -10538,7 +11538,11 @@ impl ReynApp {
         self.volume_data = std::sync::Arc::new(vec![0; 8]);
         self.volume_dims = [2, 2, 2];
         self.volume_version = self.volume_version.wrapping_add(1);
+        self.q_volume_data = std::sync::Arc::new(Vec::new());
+        self.q_volume_dims = [1, 1, 1];
         self.render_volume = false;
+        self.q_iso_on = false;
+        self.streamlines = false;
         self.insights3d.clear();
         self.f2d = None;
         self.f2d_tex.clear();
@@ -10608,6 +11612,7 @@ impl ReynApp {
         self.schedule_autosave_from_now();
         self.engine_status = "○ Project context changed · revalidating engine…".into();
         self.library.busy = true;
+        self.model_inventory_state = ModelInventoryState::Loading;
         self.library_pending_request = self.engine.send(engine::Cmd::ListModels).ok();
     }
 
@@ -11314,6 +12319,22 @@ impl ReynApp {
                 .get("wake_deficit_mean")
                 .and_then(serde_json::Value::as_f64)
                 .unwrap_or(0.0),
+            moment_origin_mode: summary
+                .get("moment_origin_mode")
+                .or_else(|| summary.get("moment_reference"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("diffuse_surface_centroid")
+                .into(),
+            moment_origin_solver: vec3("moment_origin_solver"),
+            surface_centroid_solver: vec3("surface_centroid_solver"),
+            coefficient_reference: summary
+                .get("coefficient_reference")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("q_inf * L_ref^2 ; q_inf * L_ref^3")
+                .into(),
+            reference_area_m2: summary
+                .get("reference_area_m2")
+                .and_then(serde_json::Value::as_f64),
             semigroup: summary.get("semigroup").and_then(serde_json::Value::as_f64),
             warnings,
         };
@@ -11322,6 +12343,11 @@ impl ReynApp {
         if let Some((volume, dims)) = flow::vorticity_volume(&shape, &field.velocity) {
             self.volume_data = std::sync::Arc::new(volume);
             self.volume_dims = dims;
+            self.volume_version = self.volume_version.wrapping_add(1);
+        }
+        if let Some((q_vol, q_dims)) = flow::q_criterion_volume(&shape, &field.velocity) {
+            self.q_volume_data = std::sync::Arc::new(q_vol);
+            self.q_volume_dims = q_dims;
             self.volume_version = self.volume_version.wrapping_add(1);
         }
         let mut insights = flow::insights3d(&shape, &field.velocity);
@@ -11340,7 +12366,7 @@ impl ReynApp {
                     let source_index = i * field.n * field.n + j * field.n + k;
                     let target_index = (k * field.n + j) * field.n + i;
                     mask_u8[target_index] =
-                        (field.mask[source_index].clamp(0.0, 1.0) * 255.0) as u8;
+                        cad_field_ready::surface_mask_u8_sample(field.mask[source_index]);
                     let normalized = (field.cp[source_index] / cp_scale) * 0.5 + 0.5;
                     cp_u8[target_index] = (normalized.clamp(0.0, 1.0) * 255.0) as u8;
                 }
@@ -11373,6 +12399,13 @@ impl ReynApp {
             model_support,
             preflight,
             operating,
+            review_focus: serde_json::from_value(
+                contract
+                    .get("review_focus")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            )
+            .unwrap_or_default(),
             result: Some(result),
             parent_run_id: run.parent_run_id().map(str::to_owned),
             named_regions: serde_json::from_value(
@@ -11425,8 +12458,11 @@ impl ReynApp {
         self.apply_case_view_state_from_active();
         self.rebase_case_draft_history();
         self.surface_on = true;
+        self.streamlines = true;
+        self.q_iso_on = false;
         self.volumetric = true;
-        self.render_volume = true;
+        self.render_volume = false;
+        self.slice = [false, false, false];
         self.nav = Nav::Results;
         Ok(true)
     }
@@ -11613,6 +12649,22 @@ impl ReynApp {
                     .get("wake_deficit_mean")
                     .and_then(serde_json::Value::as_f64)
                     .unwrap_or(0.0),
+                moment_origin_mode: metadata
+                    .get("moment_origin_mode")
+                    .or_else(|| metadata.get("moment_reference"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("diffuse_surface_centroid")
+                    .into(),
+                moment_origin_solver: vector("moment_origin_solver"),
+                surface_centroid_solver: vector("surface_centroid_solver"),
+                coefficient_reference: metadata
+                    .get("coefficient_reference")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("q_inf * L_ref^2 ; q_inf * L_ref^3")
+                    .into(),
+                reference_area_m2: metadata
+                    .get("reference_area_m2")
+                    .and_then(serde_json::Value::as_f64),
                 semigroup: metadata
                     .get("semigroup")
                     .and_then(serde_json::Value::as_f64),
@@ -11663,6 +12715,13 @@ impl ReynApp {
             model_support,
             preflight,
             operating,
+            review_focus: serde_json::from_value(
+                contract
+                    .get("review_focus")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            )
+            .unwrap_or_default(),
             result,
             parent_run_id: selected_run_id.clone(),
             named_regions: serde_json::from_value(
@@ -11707,6 +12766,7 @@ impl ReynApp {
                 angles,
                 grid: workflow.preflight.target_grid,
                 source_bytes,
+                selected_shell_entity_id: workflow.preflight.selected_shell_entity_id,
             };
             if self
                 .orientation_worker
@@ -11792,15 +12852,27 @@ impl ReynApp {
                 self.particles = particles;
             }
             if let Some((volume, dimensions)) = flow::vorticity_volume(&shape, velocity) {
+                let (lo, hi) = calibrate_cad_volume_density(&volume);
+                self.density_lo = lo;
+                self.density_hi = hi;
                 self.volume_data = std::sync::Arc::new(volume);
                 self.volume_dims = dimensions;
+                self.volume_version = self.volume_version.wrapping_add(1);
+            }
+            if let Some((q_vol, q_dims)) = flow::q_criterion_volume(&shape, velocity) {
+                self.q_volume_data = std::sync::Arc::new(q_vol);
+                self.q_volume_dims = q_dims;
                 self.volume_version = self.volume_version.wrapping_add(1);
             }
             let mut insights = flow::insights3d(&shape, velocity);
             insights.extend(cad::surface_insights(&mask, &cp, result_grid));
             self.insights3d = insights;
             self.surface_on = true;
-            self.render_volume = true;
+            self.streamlines = true;
+            self.q_iso_on = false;
+            self.render_volume = false;
+            self.slice = [false, false, false];
+            self.view_fit = true;
         }
         self.current_model = model_id.clone();
         self.invalidate_cad_section();
@@ -12250,7 +13322,7 @@ impl ReynApp {
         let compatible = |card: &&engine::ModelCard| {
             card.status != "invalid"
                 && engine::is_model_bundle_id(&card.id)
-                && card.authenticity_status == "verified"
+                && engine::model_authenticity_allows_external_flow(&card.authenticity_status)
                 && card.dimension == 3
                 && card.in_channels > card.out_channels
                 && card.grid > 0
@@ -12485,30 +13557,21 @@ impl ReynApp {
         let imported = ready.imported;
         let mesh_diagnostics = ready.diagnostics;
         let vm = ready.voxel;
-        let compatible = |card: &&engine::ModelCard| {
-            card.status != "invalid"
-                && engine::is_model_bundle_id(&card.id)
-                && card.authenticity_status == "verified"
-                && card.dimension == 3
-                && card.in_channels > card.out_channels
-                && card.grid > 0
-        };
         let model_card = self
             .models
             .iter()
-            .filter(compatible)
+            .filter(|card| engine::is_qualified_external_flow_model(card, vm.n))
             .find(|card| card.id == self.settings.default_3d_model)
             .or_else(|| {
                 self.models
                     .iter()
-                    .filter(compatible)
+                    .filter(|card| engine::is_qualified_external_flow_model(card, vm.n))
                     .max_by_key(|card| card.grid)
             })
             .cloned();
         let (model, model_sha256, model_max_steps, model_support, model_warning) = if let Some(
             model_card,
-        ) =
-            model_card.filter(|card| card.grid as usize == vm.n)
+        ) = model_card
         {
             (
                 model_card.id,
@@ -12680,6 +13743,7 @@ impl ReynApp {
             analyzed_mesh_sha256: analyzed_mesh_sha256.clone(),
             import_steps,
             source_shells: imported.source_shells,
+            selected_shell_entity_id: imported.selected_shell_entity_id,
             triangles: mesh_diagnostics.triangles,
             components: mesh_diagnostics.components,
             degenerate_triangles: mesh_diagnostics.degenerate_triangles,
@@ -12691,9 +13755,9 @@ impl ReynApp {
             source_extents: mesh_diagnostics.extents.map(f64::from),
             proposed_scale: vm.scale,
             solver_characteristic_length: vm.char_len as f64,
-            angle_of_attack_deg: 0.0,
-            yaw_deg: 0.0,
-            roll_deg: 0.0,
+            angle_of_attack_deg: vm.orientation.angle_of_attack_deg,
+            yaw_deg: vm.orientation.yaw_deg,
+            roll_deg: vm.orientation.roll_deg,
             transform_4x4: vm.transform_4x4,
             target_grid: vm.n,
             solid_voxels: vm.solid_voxels,
@@ -12734,19 +13798,27 @@ impl ReynApp {
             model_max_steps,
             model_support,
             preflight,
-            operating: engineering::OperatingPoint {
-                // STEP declarations prefill this control but do not
-                // approve the transform; the operator must still
-                // confirm it through the existing hard gate.
-                length_unit: declared_length_unit,
-                reference_length,
-                // Settings › Workflow default, clamped to the model.
-                horizon_steps: self
-                    .settings
-                    .default_horizon_steps
-                    .clamp(1, model_max_steps.max(1)),
-                ..Default::default()
+            operating: {
+                let mut operating = engineering::OperatingPoint {
+                    // STEP declarations prefill this control but do not
+                    // approve the transform; the operator must still
+                    // confirm it through the existing hard gate.
+                    length_unit: declared_length_unit,
+                    reference_length,
+                    // Settings › Workflow default, clamped to the model.
+                    horizon_steps: self
+                        .settings
+                        .default_horizon_steps
+                        .clamp(1, model_max_steps.max(1)),
+                    ..Default::default()
+                };
+                // Default free-stream is 1 m/s — fine for meter-scale bodies,
+                // but mm CAD lands far outside the qualified Re band. Propose a
+                // mid-envelope speed when units are already known from STEP.
+                let _ = operating.retarget_velocity_to_qualified_reynolds();
+                operating
             },
+            review_focus: engineering::ReviewFocus::default(),
             result: None,
             parent_run_id: self
                 .cad
@@ -12856,10 +13928,7 @@ impl ReynApp {
         self.orientation_pending = None;
         self.rebase_case_draft_history();
         self.nav = Nav::Case;
-        self.engine_status = format!(
-            "● {name}: {} triangles → {} solid voxels @ {}³ · preflight required",
-            mesh_diagnostics.triangles, vm.solid_voxels, vm.n
-        );
+        self.refresh_geometry_setup_status();
         self.project_notice = Some((
                 "Geometry revision stored. Confirm units, transform, preflight, and operating point before execution."
                     .into(),
@@ -12978,7 +14047,7 @@ impl ReynApp {
                 Some(("Rejected model bundles cannot be made active.".into(), true));
             return;
         }
-        if model.authenticity_status != "verified" {
+        if !engine::model_authenticity_allows_external_flow(&model.authenticity_status) {
             self.library.notice = Some((
                 format!(
                     "Unsigned or unauthenticated model bundles cannot be made active. {}",
@@ -13083,6 +14152,7 @@ impl ReynApp {
             library::LibraryAction::Refresh => {
                 self.library.busy = true;
                 self.library.notice = Some(("Refreshing model-bundle metadata…".into(), false));
+                self.model_inventory_state = ModelInventoryState::Loading;
                 self.library_pending_request = self.engine.send(engine::Cmd::ListModels).ok();
             }
         }
@@ -13324,6 +14394,7 @@ impl ReynApp {
         self.dependencies_dirty = true;
         self.engine_status = "○ Restarting engine…".into();
         self.library.busy = true;
+        self.model_inventory_state = ModelInventoryState::Loading;
         self.library_pending_request = self.engine.send(engine::Cmd::ListModels).ok();
     }
 
@@ -13386,10 +14457,42 @@ impl ReynApp {
                     if self.nav == Nav::Results && !self.volumetric {
                         self.cad_section_view(ui, rect);
                     } else {
+                        let surface_live = self.surface_on
+                            && self.cad.as_ref().is_some_and(|c| c.surf.is_some());
+                        let q_live = self.q_iso_on
+                            && !self.render_volume
+                            && !self.q_volume_data.is_empty();
+                        let volume_mode = self.volumetric
+                            && (self.render_volume || surface_live || q_live);
+                        let (vol_data, vol_dims, dens_lo, dens_hi) = if self.render_volume {
+                            (
+                                self.volume_data.clone(),
+                                self.volume_dims,
+                                self.density_lo,
+                                self.density_hi,
+                            )
+                        } else if q_live {
+                            // Tight TF window → thin vortex cores, not a fog blob.
+                            (
+                                self.q_volume_data.clone(),
+                                self.q_volume_dims,
+                                0.78,
+                                0.99,
+                            )
+                        } else {
+                            // Surface-only: density gate never opens, raymarch
+                            // still shades the Cp body from the surface textures.
+                            (
+                                self.volume_data.clone(),
+                                self.volume_dims,
+                                2.0,
+                                2.0,
+                            )
+                        };
                         let opts = viewport::ViewOpts {
                             opacity: self.opacity,
-                            density_lo: self.density_lo,
-                            density_hi: self.density_hi,
+                            density_lo: dens_lo,
+                            density_hi: dens_hi,
                             slice: [
                                 if self.slice[0] {
                                     Some(self.slice_pos[0])
@@ -13411,10 +14514,10 @@ impl ReynApp {
                             shadows: self.shadows,
                             mode2d: !self.volumetric,
                             gpu: self.gpu_ready,
-                            volume_mode: self.render_volume && self.volumetric,
+                            volume_mode,
                             volume: Some(gpu::VolumeData {
-                                data: self.volume_data.clone(),
-                                dims: self.volume_dims,
+                                data: vol_data,
+                                dims: vol_dims,
                                 version: self.volume_version,
                             }),
                             surface: if self.surface_on {
@@ -13452,6 +14555,9 @@ impl ReynApp {
                                     Some(viewport::ModelVelocityField {
                                         n: fields.n,
                                         vel: std::sync::Arc::<[f32]>::from(fields.velocity.to_vec()),
+                                        mask: Some(std::sync::Arc::<[f32]>::from(
+                                            fields.mask.to_vec(),
+                                        )),
                                     })
                                 })
                             } else {
@@ -17507,14 +18613,28 @@ fn engineering_section_image(section: &engineering_section::SectionPlane) -> egu
             (section.mask_value(neighbor_row, neighbor_column) >= 0.5) != solid
         })
     };
+    let lic = section.in_plane.as_ref().map(|uv| {
+        engineering_section::line_integral_convolution(n, uv, 12)
+    });
     let mut pixels = Vec::with_capacity(n * n);
     for row in 0..n {
         for column in 0..n {
             let mask = section.mask_value(row, column).clamp(0.0, 1.0);
-            let base = field2d::colormap_color(
+            let mut base = field2d::colormap_color(
                 section.scale.normalize(section.value(row, column)),
                 section.quantity.signed(),
             );
+            if let Some(lic) = lic.as_ref() {
+                // Modulate speed colormap with LIC texture for Fluent-style planar flow.
+                let t = lic[row * n + column];
+                let shade = 0.45 + 0.70 * t;
+                base = Color32::from_rgba_unmultiplied(
+                    ((base.r() as f32) * shade).min(255.0) as u8,
+                    ((base.g() as f32) * shade).min(255.0) as u8,
+                    ((base.b() as f32) * shade).min(255.0) as u8,
+                    base.a(),
+                );
+            }
             let color = if is_boundary(row, column) {
                 BRAND
             } else if mask >= 0.5 {
@@ -20087,6 +21207,90 @@ mod tests {
         assert_eq!(complete[3].glyph, StageGlyph::Complete);
     }
 
+    fn qualified_model(id: &str) -> engine::ModelCard {
+        engine::ModelCard {
+            id: format!("reyn_models/{id}.reynmodel"),
+            name: id.into(),
+            managed: true,
+            size_bytes: 1,
+            modified_unix: 1,
+            checkpoint_sha256: "a".repeat(64),
+            status: "clean".into(),
+            status_detail: String::new(),
+            dimension: 3,
+            grid: 64,
+            in_channels: 4,
+            out_channels: 3,
+            max_steps: 32,
+            epoch: 1,
+            declared_epochs: 1,
+            checkpoint_role: "fixed_final".into(),
+            scenario: "obstacle".into(),
+            source_digest: Some("source".into()),
+            physics_contract: engine::EXTERNAL_FLOW_MODEL_PHYSICS_CONTRACT.into(),
+            authenticity_status: "verified".into(),
+            publisher_key_id: Some("release".into()),
+            publisher_key_sha256: Some("b".repeat(64)),
+            release_sequence: Some(1),
+            support: Vec::new(),
+            limitations: Vec::new(),
+            benchmark_report_hashes: Vec::new(),
+            unknown_fields: Vec::new(),
+            qualification_class: engine::MODEL_QUALIFICATION_PRODUCTION.into(),
+        }
+    }
+
+    #[test]
+    fn model_selector_states_are_explicit_and_preserve_missing_identity() {
+        let first = qualified_model("first");
+        let second = qualified_model("second");
+        assert_eq!(
+            model_selector_mode(&ModelInventoryState::Loading, &[], "", 64),
+            ModelSelectorMode::Loading
+        );
+        assert_eq!(
+            model_selector_mode(&ModelInventoryState::Failed("offline".into()), &[], "", 64,),
+            ModelSelectorMode::Failed("offline".into())
+        );
+        assert_eq!(
+            model_selector_mode(&ModelInventoryState::Ready, &[], "", 64),
+            ModelSelectorMode::NoneQualified
+        );
+        assert_eq!(
+            model_selector_mode(
+                &ModelInventoryState::Ready,
+                std::slice::from_ref(&first),
+                "",
+                64,
+            ),
+            ModelSelectorMode::OneQualified(first.id.clone())
+        );
+        assert_eq!(
+            model_selector_mode(
+                &ModelInventoryState::Ready,
+                &[first.clone(), second],
+                "",
+                64,
+            ),
+            ModelSelectorMode::MultipleQualified
+        );
+        assert_eq!(
+            model_selector_mode(
+                &ModelInventoryState::Ready,
+                std::slice::from_ref(&first),
+                "reyn_models/missing.reynmodel",
+                64,
+            ),
+            ModelSelectorMode::StoredModelMissing("reyn_models/missing.reynmodel".into())
+        );
+        let mut bundled_2d = first;
+        bundled_2d.dimension = 2;
+        assert_eq!(
+            model_selector_mode(&ModelInventoryState::Ready, &[bundled_2d], "", 64),
+            ModelSelectorMode::NoneQualified
+        );
+    }
+
     fn summary_case_fixture() -> engineering::ExternalFlowCase {
         engineering::ExternalFlowCase {
             stage: engineering::CaseStage::Results,
@@ -20113,6 +21317,7 @@ mod tests {
                 horizon_steps: 4,
                 ..engineering::OperatingPoint::default()
             },
+            review_focus: engineering::ReviewFocus::default(),
             result: Some(engineering::EngineeringResult {
                 method: engineering::SURFACE_LOAD_METHOD.into(),
                 cp_min: -1.5,
@@ -20128,8 +21333,10 @@ mod tests {
                 divergence_rms: 1e-3,
                 wake_deficit_peak: 0.3,
                 wake_deficit_mean: 0.1,
+                moment_origin_mode: "diffuse_surface_centroid".into(),
                 semigroup: Some(0.02),
                 warnings: Vec::new(),
+                ..Default::default()
             }),
             parent_run_id: None,
             named_regions: Vec::new(),
@@ -20453,6 +21660,7 @@ mod tests {
             angles: [angle, 0.0, 0.0],
             grid: 32,
             source_bytes: vec![generation as u8],
+            selected_shell_entity_id: Some(10 + generation),
         };
         tx.send(request(2, 4.0)).unwrap();
         tx.send(request(3, 7.5)).unwrap();
@@ -20461,6 +21669,39 @@ mod tests {
         assert_eq!(newest.request_id, "orientation-3");
         assert_eq!(newest.angles, [7.5, 0.0, 0.0]);
         assert_eq!(newest.source_bytes, vec![3]);
+        assert_eq!(newest.selected_shell_entity_id, Some(13));
+    }
+
+    #[test]
+    fn geometry_setup_status_names_transform_gate_not_preflight() {
+        let mut preflight = engineering::GeometryPreflight {
+            source_sha256: "a".repeat(64),
+            source_bytes: 1024,
+            triangles: 12,
+            solid_voxels: 216,
+            target_grid: 64,
+            components: 1,
+            source_extents: [1.0; 3],
+            proposed_scale: 1.0,
+            solver_characteristic_length: 0.6,
+            transform_4x4: [
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+            ],
+            voxel_components: 1,
+            minimum_cells_across: 4,
+            boundary_clearance_cells: 6,
+            voxel_classification_version: 2,
+            ..engineering::GeometryPreflight::default()
+        };
+        let waiting = geometry_setup_engine_status("cuboid_ap214", &preflight);
+        assert!(waiting.contains("transform approval required"), "{waiting}");
+        assert!(!waiting.contains("preflight required"), "{waiting}");
+        preflight.transform_approved = true;
+        let accepted = geometry_setup_engine_status("cuboid_ap214", &preflight);
+        assert!(accepted.contains("geometry accepted"), "{accepted}");
+        preflight.boundary_edges = 1;
+        let incomplete = geometry_setup_engine_status("cuboid_ap214", &preflight);
+        assert!(incomplete.contains("preflight incomplete"), "{incomplete}");
     }
 
     #[test]
@@ -20547,6 +21788,7 @@ mod tests {
                 angles: [12.0, -2.0, 0.5],
                 grid: 32,
                 source_bytes: vec![0; 4],
+                selected_shell_entity_id: None,
             })
             .unwrap();
         let completed = worker
@@ -20756,6 +21998,25 @@ mod tests {
             "injected atomic write failure".to_string()
         );
         assert!(dropped.get(), "failed transient payload must be released");
+    }
+
+    #[test]
+    fn cad_volume_density_calibration_opens_thin_wake_fields() {
+        let mut volume = vec![0u8; 64 * 64 * 64];
+        for value in volume.iter_mut().take(400) {
+            *value = 40;
+        }
+        for value in volume.iter_mut().skip(400).take(80) {
+            *value = 200;
+        }
+        let (lo, hi) = calibrate_cad_volume_density(&volume);
+        assert!(
+            lo < 0.50,
+            "CAD wakes must not inherit sandbox density_lo≈0.85 (got {lo})"
+        );
+        assert!(hi > lo + 0.05, "lo={lo} hi={hi}");
+        let (empty_lo, empty_hi) = calibrate_cad_volume_density(&[]);
+        assert!(empty_lo < empty_hi);
     }
 
     #[test]

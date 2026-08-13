@@ -1476,6 +1476,7 @@ mod tests {
             limitations: vec!["Fixed-body external flow only".into()],
             benchmark_report_hashes: vec![],
             unknown_fields: vec![],
+            qualification_class: crate::engine::MODEL_QUALIFICATION_RESEARCH.into(),
         }
     }
 

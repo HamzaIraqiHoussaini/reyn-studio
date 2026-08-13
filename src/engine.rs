@@ -122,6 +122,145 @@ pub struct ModelCard {
     pub limitations: Vec<String>,
     pub benchmark_report_hashes: Vec<String>,
     pub unknown_fields: Vec<String>,
+    /// Fail-closed release class for Studio execution claims.
+    ///
+    /// - `production`: may qualify for external-flow CAD when the contract matches
+    /// - `preview` / `research`: authenticatable and inspectable, never production CAD
+    /// - `unknown`: treated as incomplete
+    pub qualification_class: String,
+}
+
+pub const EXTERNAL_FLOW_MODEL_PHYSICS_CONTRACT: &str = "fixed_body_brinkman.v1";
+pub const MODEL_QUALIFICATION_PRODUCTION: &str = "production";
+pub const MODEL_QUALIFICATION_PREVIEW: &str = "preview";
+pub const MODEL_QUALIFICATION_RESEARCH: &str = "research";
+pub const MODEL_QUALIFICATION_UNKNOWN: &str = "unknown";
+pub const YC_PREVIEW_MODEL_RELEASE_SCHEMA: &str = "com.reyn.yc-preview-model-release/1";
+
+/// Local trusted-checkpoint escape hatch. When
+/// `REYN_MODEL_DEVELOPMENT_UNSIGNED=1`, Studio accepts the engine's
+/// `development_unsigned_override` authenticity status for external-flow CAD.
+/// Signed production publishers still use `verified`. Never set this in release
+/// packaging.
+pub fn development_unsigned_models_allowed() -> bool {
+    matches!(
+        std::env::var("REYN_MODEL_DEVELOPMENT_UNSIGNED").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
+}
+
+pub fn model_authenticity_allows_external_flow(status: &str) -> bool {
+    status == "verified"
+        || (development_unsigned_models_allowed() && status == "development_unsigned_override")
+}
+
+/// Derive the release class from published identity and limitations.
+/// Preview / research labels always win over a clean authenticity status so a
+/// YC preview pack cannot silently become a production CAD qualifier.
+pub fn derive_model_qualification_class(
+    version: &str,
+    limitations: &[String],
+    status: &str,
+) -> String {
+    let version = version.to_ascii_lowercase();
+    let limitation_blob = limitations
+        .iter()
+        .map(|line| line.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if version.contains("yc-preview")
+        || version.contains("preview")
+        || limitation_blob.contains("not production-qualified")
+        || limitation_blob.contains("yc research preview")
+    {
+        return MODEL_QUALIFICATION_PREVIEW.into();
+    }
+    if limitation_blob.contains("research")
+        || limitation_blob.contains("not production")
+        || version.contains("research")
+    {
+        return MODEL_QUALIFICATION_RESEARCH.into();
+    }
+    if status == "clean"
+        && !limitation_blob.contains("incomplete")
+        && !limitation_blob.contains("preview")
+    {
+        return MODEL_QUALIFICATION_PRODUCTION.into();
+    }
+    MODEL_QUALIFICATION_UNKNOWN.into()
+}
+
+pub fn external_flow_model_issues(model: &ModelCard, target_grid: usize) -> Vec<String> {
+    let mut issues = Vec::new();
+    if !is_model_bundle_id(&model.id) {
+        issues.push("the artifact does not have a canonical .reynmodel identity".into());
+    }
+    if !model_authenticity_allows_external_flow(&model.authenticity_status) {
+        issues.push("publisher authenticity is not verified".into());
+    }
+    if model.qualification_class != MODEL_QUALIFICATION_PRODUCTION {
+        issues.push(format!(
+            "qualification class is {}, not production (preview/research packs cannot run external-flow CAD)",
+            if model.qualification_class.trim().is_empty() {
+                MODEL_QUALIFICATION_UNKNOWN
+            } else {
+                model.qualification_class.as_str()
+            }
+        ));
+    }
+    if model.status != "clean" {
+        issues.push(format!(
+            "qualification status is {}",
+            if model.status.trim().is_empty() {
+                "unknown"
+            } else {
+                model.status.as_str()
+            }
+        ));
+    }
+    if model.dimension != 3 {
+        issues.push(format!("dimension is {}D, not 3D", model.dimension));
+    }
+    if model.grid as usize != target_grid {
+        issues.push(format!(
+            "grid is {}³, but this geometry requires {}³",
+            model.grid, target_grid
+        ));
+    }
+    if model.in_channels != 4 || model.out_channels != 3 {
+        issues.push(format!(
+            "channels are {}→{}, not the required 4→3 contract",
+            model.in_channels, model.out_channels
+        ));
+    }
+    if model.scenario != "obstacle" {
+        issues.push(format!(
+            "scenario is {:?}, not fixed-body obstacle flow",
+            model.scenario
+        ));
+    }
+    if model.physics_contract != EXTERNAL_FLOW_MODEL_PHYSICS_CONTRACT {
+        issues.push(format!(
+            "physics contract is {:?}, not {}",
+            model.physics_contract, EXTERNAL_FLOW_MODEL_PHYSICS_CONTRACT
+        ));
+    }
+    if model.max_steps == 0 {
+        issues.push("no supported prediction horizon is declared".into());
+    }
+    if model.checkpoint_sha256.len() != 64
+        || !model
+            .checkpoint_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        issues.push("checkpoint SHA-256 is missing or non-canonical".into());
+    }
+    issues
+}
+
+pub fn is_qualified_external_flow_model(model: &ModelCard, target_grid: usize) -> bool {
+    external_flow_model_issues(model, target_grid).is_empty()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -293,6 +432,12 @@ pub enum Cmd {
         velocity_mps: f32,
         density_kg_m3: f32,
         reference_pressure_pa: f32,
+        /// `diffuse_surface_centroid` or `source_frame_point`.
+        moment_origin_mode: String,
+        /// Solver-frame origin used when mode is `source_frame_point`.
+        moment_origin_solver: Option<[f32; 3]>,
+        /// Optional aero reference area in m² for coefficient reporting.
+        reference_area_m2: Option<f32>,
     },
     /// N5 — run the benchmark suite (seeds × horizons) on a 2D checkpoint.
     RunBenchmark {
@@ -387,6 +532,11 @@ pub struct CadField {
     pub divergence_rms: f32,
     pub wake_deficit_peak: f32,
     pub wake_deficit_mean: f32,
+    pub moment_origin_mode: String,
+    pub moment_origin_solver: [f32; 3],
+    pub surface_centroid_solver: [f32; 3],
+    pub coefficient_reference: String,
+    pub reference_area_m2: Option<f32>,
     /// Unused on the engineering CAD path (sandbox-only concept). Kept optional
     /// so older engine metadata still parses.
     pub semigroup: Option<f32>,
@@ -516,6 +666,11 @@ fn guard_model_request(
     if let Err(error) = require_model_bundle_id(model) {
         return Ok(Msg::Error(error.to_string()));
     }
+    // Local trusted-checkpoint escape hatch. The Python sidecar still enforces
+    // development_allow_unsigned itself when the request reaches it.
+    if development_unsigned_models_allowed() {
+        return request();
+    }
     #[cfg(test)]
     if research_dir
         .join(DEVELOPMENT_UNSIGNED_FIXTURE_MARKER)
@@ -628,7 +783,7 @@ fn bundle_resources(current_exe: &Path) -> Option<PathBuf> {
 fn bundle_resources_for(current_exe: &Path, platform: &str) -> Option<PathBuf> {
     if matches!(
         platform.to_ascii_lowercase().as_str(),
-        "windows" | "win32" | "win64"
+        "windows" | "win32" | "win64" | "linux"
     ) {
         let directory = current_exe.parent()?;
         let resources = directory.join("resources");
@@ -1222,8 +1377,11 @@ fn worker(
                 velocity_mps,
                 density_kg_m3,
                 reference_pressure_pa,
+                moment_origin_mode,
+                moment_origin_solver,
+                reference_area_m2,
             } => {
-                let req = serde_json::json!({
+                let mut req = serde_json::json!({
                     "op": "predict_cad",
                     "request_id": request_id,
                     "model": model,
@@ -1234,8 +1392,16 @@ fn worker(
                     "velocity_mps": velocity_mps,
                     "density_kg_m3": density_kg_m3,
                     "reference_pressure_pa": reference_pressure_pa,
-                })
-                .to_string();
+                    "moment_origin_mode": moment_origin_mode,
+                });
+                if let Some(origin) = moment_origin_solver {
+                    req["moment_origin_solver"] =
+                        serde_json::json!([origin[0], origin[1], origin[2]]);
+                }
+                if let Some(area) = reference_area_m2 {
+                    req["reference_area_m2"] = serde_json::json!(area);
+                }
+                let req = req.to_string();
                 let bytes: Vec<u8> = mask.iter().flat_map(|v| v.to_le_bytes()).collect();
                 let progress_tx = msg_tx.clone();
                 let progress_request = request_context.clone();
@@ -1373,12 +1539,82 @@ fn parse_model_card(value: &serde_json::Value) -> Option<ModelCard> {
         limitations: json_strings(&value["limitations"]),
         benchmark_report_hashes: json_strings(&value["benchmark_report_hashes"]),
         unknown_fields: json_strings(&value["unknown_fields"]),
+        qualification_class: String::new(),
     };
+    card.qualification_class = value["qualification_class"]
+        .as_str()
+        .map(str::to_owned)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            derive_model_qualification_class(
+                // Prefer the human-facing version token when present in name/id.
+                value["version"]
+                    .as_str()
+                    .or_else(|| value["model_version"].as_str())
+                    .unwrap_or(card.name.as_str()),
+                &card.limitations,
+                &card.status,
+            )
+        });
     if !is_model_bundle_id(&card.id) || !is_model_bundle_id(&card.name) {
         card.status = "invalid".into();
         card.status_detail = TRUSTED_MODEL_CONVERSION_GUIDANCE.into();
+        card.qualification_class = MODEL_QUALIFICATION_UNKNOWN.into();
     }
     Some(card)
+}
+
+/// Validate the packaged YC preview release manifest schema (fail closed).
+pub fn validate_yc_preview_model_release(manifest: &serde_json::Value) -> Result<(), String> {
+    let schema = manifest
+        .get("schema")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if schema != YC_PREVIEW_MODEL_RELEASE_SCHEMA {
+        return Err(format!(
+            "preview model release schema is {schema:?}, expected {YC_PREVIEW_MODEL_RELEASE_SCHEMA}"
+        ));
+    }
+    let boundary = manifest
+        .get("qualification_boundary")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if boundary.is_empty() {
+        return Err("preview model release omits qualification_boundary".into());
+    }
+    if !boundary.to_ascii_lowercase().contains("incomplete")
+        && !boundary.to_ascii_lowercase().contains("preview")
+    {
+        return Err(
+            "preview model qualification_boundary must state incomplete/preview status".into(),
+        );
+    }
+    let version = manifest
+        .pointer("/model/version")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if derive_model_qualification_class(version, &[], "clean") != MODEL_QUALIFICATION_PREVIEW {
+        return Err(format!(
+            "preview model version {version:?} is not classified as preview"
+        ));
+    }
+    for key in ["bundle_sha256", "weights_sha256", "tuf_root_sha256"] {
+        let digest = manifest
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(format!(
+                "preview model release {key} is missing or non-canonical"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn parse_model_validation(value: &serde_json::Value) -> Option<ModelValidation> {
@@ -2021,6 +2257,17 @@ fn parse_cad_field(j: &serde_json::Value, payload: &[u8]) -> Msg {
         divergence_rms: f("divergence_rms"),
         wake_deficit_peak: f("wake_deficit_peak"),
         wake_deficit_mean: f("wake_deficit_mean"),
+        moment_origin_mode: j["moment_origin_mode"]
+            .as_str()
+            .unwrap_or("diffuse_surface_centroid")
+            .to_string(),
+        moment_origin_solver: vector("moment_origin_solver"),
+        surface_centroid_solver: vector("surface_centroid_solver"),
+        coefficient_reference: j["coefficient_reference"]
+            .as_str()
+            .unwrap_or("q_inf * L_ref^2 ; q_inf * L_ref^3")
+            .to_string(),
+        reference_area_m2: j["reference_area_m2"].as_f64().map(|value| value as f32),
         semigroup: j["semigroup"].as_f64().map(|value| value as f32),
         load_method: j["load_method"].as_str().unwrap_or("unknown").to_string(),
         warnings: j["warnings"]
@@ -2384,6 +2631,22 @@ assert loaded.authenticity["status"] == "development_unsigned_override"
     }
 
     #[test]
+    fn linux_portable_resources_resolve_beside_executable() {
+        let fixture = TempFixture::new("linux-portable");
+        let executable = fixture.file("portable/reyn-studio");
+        let script = fixture.file("portable/resources/engine/reyn_engine.py");
+        let research = fixture.research("portable/resources/research");
+        let resources = bundle_resources_for(&executable, "linux").unwrap();
+        assert_eq!(resources, fixture.root.join("portable/resources"));
+        assert_eq!(resources.join(ENGINE_ENTRYPOINT), script);
+        assert_eq!(resources.join("research"), research);
+        assert_eq!(
+            bundle_resources_for(&executable, "linux"),
+            Some(fixture.root.join("portable/resources"))
+        );
+    }
+
+    #[test]
     fn windows_release_marker_prevents_developer_fallback_when_resources_are_missing() {
         let fixture = TempFixture::new("windows-incomplete");
         let executable = fixture.file("portable/Reyn Studio.exe");
@@ -2564,6 +2827,93 @@ assert loaded.authenticity["status"] == "development_unsigned_override"
         assert_eq!(legacy.status, "invalid");
         assert!(legacy.status_detail.contains("never opened"));
         assert!(parse_model_card(&serde_json::json!({"name": "bad"})).is_none());
+    }
+
+    #[test]
+    fn external_flow_qualification_requires_the_exact_verified_contract() {
+        let qualified = ModelCard {
+            id: "reyn_models/external-h64.reynmodel".into(),
+            name: "External H64".into(),
+            managed: true,
+            size_bytes: 1,
+            modified_unix: 1,
+            checkpoint_sha256: "a".repeat(64),
+            status: "clean".into(),
+            status_detail: String::new(),
+            dimension: 3,
+            grid: 64,
+            in_channels: 4,
+            out_channels: 3,
+            max_steps: 32,
+            epoch: 1,
+            declared_epochs: 1,
+            checkpoint_role: "fixed_final".into(),
+            scenario: "obstacle".into(),
+            source_digest: Some("source".into()),
+            physics_contract: EXTERNAL_FLOW_MODEL_PHYSICS_CONTRACT.into(),
+            authenticity_status: "verified".into(),
+            publisher_key_id: Some("release".into()),
+            publisher_key_sha256: Some("b".repeat(64)),
+            release_sequence: Some(1),
+            support: Vec::new(),
+            limitations: Vec::new(),
+            benchmark_report_hashes: Vec::new(),
+            unknown_fields: Vec::new(),
+            qualification_class: MODEL_QUALIFICATION_PRODUCTION.into(),
+        };
+        assert!(is_qualified_external_flow_model(&qualified, 64));
+        for mismatch in [
+            {
+                let mut model = qualified.clone();
+                model.authenticity_status = "unsigned".into();
+                model
+            },
+            {
+                let mut model = qualified.clone();
+                model.dimension = 2;
+                model
+            },
+            {
+                let mut model = qualified.clone();
+                model.grid = 32;
+                model
+            },
+            {
+                let mut model = qualified.clone();
+                model.physics_contract = "generic".into();
+                model
+            },
+            {
+                let mut model = qualified.clone();
+                model.qualification_class = MODEL_QUALIFICATION_PREVIEW.into();
+                model
+            },
+        ] {
+            assert!(!is_qualified_external_flow_model(&mismatch, 64));
+        }
+    }
+
+    #[test]
+    fn yc_preview_release_manifest_is_fail_closed_and_non_production() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("packaging/models/yc-preview-h64/model-release-manifest.json");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("preview release manifest"))
+                .expect("preview release JSON");
+        validate_yc_preview_model_release(&manifest).expect("schema validates");
+        assert_eq!(
+            derive_model_qualification_class(
+                manifest["model"]["version"].as_str().unwrap(),
+                &[],
+                "clean"
+            ),
+            MODEL_QUALIFICATION_PREVIEW
+        );
+        let mut production_claim = manifest.clone();
+        production_claim["model"]["version"] = serde_json::json!("1.0.0");
+        production_claim["qualification_boundary"] =
+            serde_json::json!("Fully production qualified.");
+        assert!(validate_yc_preview_model_release(&production_claim).is_err());
     }
 
     #[test]
@@ -2895,6 +3245,9 @@ assert loaded.authenticity["status"] == "development_unsigned_override"
             velocity_mps: 1.0,
             density_kg_m3: 1.225,
             reference_pressure_pa: 101_325.0,
+            moment_origin_mode: "diffuse_surface_centroid".into(),
+            moment_origin_solver: None,
+            reference_area_m2: None,
         })
         .unwrap();
         match wait_for(&h, |m| matches!(m, Msg::CadField(_) | Msg::Error(_)), 90) {

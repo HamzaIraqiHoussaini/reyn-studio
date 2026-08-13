@@ -3387,6 +3387,7 @@ mod tests {
             reference_pressure: 100_800.0,
             flow_direction: [1.0, 0.0, 0.0],
             horizon_steps: 12,
+            ..OperatingPoint::default()
         };
         let template = CaseTemplate::from_draft(
             "Aero review",

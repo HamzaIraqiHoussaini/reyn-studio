@@ -908,6 +908,36 @@ mod tests {
         );
     }
 
+    fn paraview_smoke_fixture_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("docs/qa/paraview-vtk-smoke/fixture.vtk")
+    }
+
+    #[test]
+    fn golden_paraview_smoke_fixture_matches_exporter() {
+        let expected = bytes(&fixture());
+        let path = paraview_smoke_fixture_path();
+        if std::env::var_os("REYN_WRITE_PARAVIEW_VTK_FIXTURE").is_some() {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("create ParaView smoke fixture directory");
+            }
+            std::fs::write(&path, &expected).expect("write ParaView smoke fixture");
+        }
+        let actual = std::fs::read(&path).unwrap_or_else(|error| {
+            panic!(
+                "missing ParaView smoke fixture at {}: {error}; regenerate with \
+                 REYN_WRITE_PARAVIEW_VTK_FIXTURE=1 cargo test --bin reyn-studio \
+                 golden_paraview_smoke_fixture_matches_exporter",
+                path.display()
+            )
+        });
+        assert_eq!(
+            actual, expected,
+            "ParaView smoke fixture drifted from vtk_export::tests::fixture(); regenerate with \
+             REYN_WRITE_PARAVIEW_VTK_FIXTURE=1"
+        );
+    }
+
     #[test]
     fn atomic_write_publishes_complete_bytes_without_temp_residue() {
         let export = fixture();

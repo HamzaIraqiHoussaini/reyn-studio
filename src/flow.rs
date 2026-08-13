@@ -172,6 +172,57 @@ pub fn vorticity_volume(shape: &[usize], data: &[f32]) -> Option<(Vec<u8>, [u32;
     Some((bytes, [nx as u32, ny as u32, nz as u32]))
 }
 
+/// Q-criterion scalar volume from an engine velocity field `[3,N,N,N]`.
+/// Stores `max(Q, 0)` normalized to `[0,1]` for a thin iso-surface TF window.
+/// Q = ½(‖Ω‖² − ‖S‖²); positive values mark rotation-dominated vortex cores.
+pub fn q_criterion_volume(shape: &[usize], data: &[f32]) -> Option<(Vec<u8>, [u32; 3])> {
+    if shape.len() != 4 || shape[0] != 3 {
+        return None;
+    }
+    let (nx, ny, nz) = (shape[1], shape[2], shape[3]);
+    if nx < 3 || ny < 3 || nz < 3 || data.len() < 3 * nx * ny * nz {
+        return None;
+    }
+    let at = |c: usize, i: usize, j: usize, k: usize| data[((c * nx + i) * ny + j) * nz + k];
+    let cl = |v: i64, n: usize| v.clamp(0, n as i64 - 1) as usize;
+    let mut q_field = vec![0f32; nx * ny * nz];
+    let mut maxq = 1e-6f32;
+    for i in 0..nx {
+        let (ip, im) = (cl(i as i64 + 1, nx), cl(i as i64 - 1, nx));
+        for j in 0..ny {
+            let (jp, jm) = (cl(j as i64 + 1, ny), cl(j as i64 - 1, ny));
+            for k in 0..nz {
+                let (kp, km) = (cl(k as i64 + 1, nz), cl(k as i64 - 1, nz));
+                let mut g = [[0f32; 3]; 3];
+                for (c, row) in g.iter_mut().enumerate() {
+                    row[0] = 0.5 * (at(c, ip, j, k) - at(c, im, j, k));
+                    row[1] = 0.5 * (at(c, i, jp, k) - at(c, i, jm, k));
+                    row[2] = 0.5 * (at(c, i, j, kp) - at(c, i, j, km));
+                }
+                let (mut oo, mut ss) = (0f32, 0f32);
+                for a in 0..3 {
+                    for b in 0..3 {
+                        let om = 0.5 * (g[a][b] - g[b][a]);
+                        let st = 0.5 * (g[a][b] + g[b][a]);
+                        oo += om * om;
+                        ss += st * st;
+                    }
+                }
+                let q = (0.5 * (oo - ss)).max(0.0);
+                q_field[(k * ny + j) * nx + i] = q;
+                if q > maxq {
+                    maxq = q;
+                }
+            }
+        }
+    }
+    let bytes = q_field
+        .iter()
+        .map(|q| ((q / maxq).clamp(0.0, 1.0) * 255.0) as u8)
+        .collect();
+    Some((bytes, [nx as u32, ny as u32, nz as u32]))
+}
+
 /// The 3D counterparts of the 2D Field Insights, found in one gradient pass over
 /// an engine field: strongest rotation (max |ω|), fastest flow (max |v|), and
 /// the **Q-criterion maximum** — the standard vortex-core detector
@@ -393,5 +444,33 @@ mod tests {
                 assert!(ins.pos[a] >= -1.0 && ins.pos[a] <= 1.0);
             }
         }
+    }
+
+    #[test]
+    fn q_criterion_volume_is_nonempty_on_a_synthetic_vortex() {
+        // Solid-body rotation in the XY plane: Q > 0 at the core.
+        let n = 16usize;
+        let mut data = vec![0f32; 3 * n * n * n];
+        let at = |c: usize, i: usize, j: usize, k: usize| ((c * n + i) * n + j) * n + k;
+        let s = 2.0f32;
+        let (xc, yc) = (n / 2, n / 2);
+        for i in 0..n {
+            for j in 0..n {
+                for k in 0..n {
+                    let x = i as f32 - xc as f32;
+                    let y = j as f32 - yc as f32;
+                    data[at(0, i, j, k)] = -s * y;
+                    data[at(1, i, j, k)] = s * x;
+                    data[at(2, i, j, k)] = 0.0;
+                }
+            }
+        }
+        let (bytes, dims) = q_criterion_volume(&[3, n, n, n], &data).expect("q volume");
+        assert_eq!(dims, [n as u32, n as u32, n as u32]);
+        assert_eq!(bytes.len(), n * n * n);
+        let peak = *bytes.iter().max().unwrap();
+        assert!(peak > 200, "vortex core should saturate the Q TF ({peak})");
+        let core = bytes[((n / 2) * n + (n / 2)) * n + (n / 2)];
+        assert!(core > 100, "core voxel should be hot ({core})");
     }
 }

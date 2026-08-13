@@ -30,7 +30,6 @@ pub struct StepImport {
     pub tessellation_tolerance_source_units: f64,
     pub vertex_weld_relative_tolerance: f64,
     pub shell_count: usize,
-    #[allow(dead_code)] // recorded for evidence; chooser path sets it when pick-one runs
     pub selected_shell_entity_id: Option<u64>,
     pub warnings: Vec<String>,
 }
@@ -531,6 +530,31 @@ mod tests {
         .expect("STEP cuboid should support orientation re-voxelization");
     }
 
+
+    #[test]
+    fn cuboid_minimum_cells_across_at_64() {
+        let bytes = include_bytes!("../test-geometry/cuboid_ap214.step");
+        let imported = parse_step(bytes).expect("STEP cuboid");
+        let diagnostics = crate::cad::diagnose_mesh(&imported.mesh);
+        let orientation =
+            crate::cad::BodyOrientation::align_longest_extent_to_stream(diagnostics.extents);
+        let vm = crate::cad::voxelize_oriented(&imported.mesh, 64, orientation)
+            .expect("voxelize 64");
+        eprintln!(
+            "cuboid64 solid={} min_cells={} clearance={} orientation={:?} disagreement={:.4}",
+            vm.solid_voxels,
+            vm.minimum_cells_across,
+            vm.boundary_clearance_cells,
+            orientation.to_degrees(),
+            vm.axis_disagreement_fraction
+        );
+        assert!(
+            vm.minimum_cells_across >= 3,
+            "expected >=3 cells across, got {}",
+            vm.minimum_cells_across
+        );
+    }
+
     #[test]
     fn complex_ap242_translation_is_deterministic_and_defects_remain_visible() {
         let bytes = include_bytes!("../test-geometry/part_ap242.step");
@@ -580,5 +604,203 @@ mod tests {
         let bytes = include_bytes!("../test-geometry/corpus/malformed_truncated.step");
         let err = parse_step(bytes).expect_err("truncated STEP must fail closed");
         assert!(!err.is_empty(), "malformed import must return an error");
+    }
+
+    #[test]
+    fn nist_ctc01_ap203_geom_imports_deterministically() {
+        let bytes = include_bytes!("../test-geometry/corpus/vendor/nist_ctc01_ap203_geom.step");
+        let first = parse_step(bytes).expect("NIST CTC-01 AP203 geometry should import");
+        let second = parse_step(bytes).expect("repeat NIST CTC-01 import should succeed");
+        assert_eq!(first.shell_count, 1);
+        assert!(first.mesh.tris.len() >= 12);
+        assert_eq!(
+            crate::cad::analyzed_mesh_sha256(&first.mesh),
+            crate::cad::analyzed_mesh_sha256(&second.mesh)
+        );
+        assert_eq!(
+            first.tessellation_tolerance_source_units,
+            second.tessellation_tolerance_source_units
+        );
+    }
+
+    #[test]
+    fn nist_ftc06_ap203_geom_imports_or_records_honest_ceiling() {
+        let bytes = include_bytes!("../test-geometry/corpus/vendor/nist_ftc06_ap203_geom.step");
+        match parse_step(bytes) {
+            Ok(imported) => {
+                assert_eq!(imported.shell_count, 1);
+                assert!(imported.mesh.tris.len() >= 12);
+                let again = parse_step(bytes).expect("repeat FTC-06 import");
+                assert_eq!(
+                    crate::cad::analyzed_mesh_sha256(&imported.mesh),
+                    crate::cad::analyzed_mesh_sha256(&again.mesh)
+                );
+            }
+            Err(error) => {
+                // Keep the failure visible: this is corpus evidence for OCCT gating.
+                assert!(
+                    !error.is_empty(),
+                    "NIST FTC-06 reject must carry an actionable message"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nist_ctc01_ap242_with_pmi_imports_or_records_honest_ceiling() {
+        let bytes = include_bytes!("../test-geometry/corpus/vendor/nist_ctc01_ap242_e1.step");
+        match parse_step(bytes) {
+            Ok(imported) => {
+                assert_eq!(imported.shell_count, 1);
+                let again = parse_step(bytes).expect("repeat AP242 CTC-01 import");
+                assert_eq!(
+                    crate::cad::analyzed_mesh_sha256(&imported.mesh),
+                    crate::cad::analyzed_mesh_sha256(&again.mesh)
+                );
+            }
+            Err(error) => {
+                assert!(
+                    !error.is_empty(),
+                    "NIST CTC-01 AP242 reject must carry an actionable message"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nist_ctc03_and_ctc05_ap203_geom_import_deterministically() {
+        for bytes in [
+            include_bytes!("../test-geometry/corpus/vendor/nist_ctc03_ap203_geom.step").as_slice(),
+            include_bytes!("../test-geometry/corpus/vendor/nist_ctc05_ap203_geom.step").as_slice(),
+        ] {
+            let imported = match parse_step_selecting(bytes, None) {
+                Ok(imported) => imported,
+                Err(StepParseError::ChooseShell(choice)) => {
+                    let selected = choice.shells[0].entity_id;
+                    parse_step_selecting(bytes, Some(selected))
+                        .expect("NIST multi-shell CTC should import after pick-one")
+                }
+                Err(StepParseError::Message(error)) => {
+                    panic!("NIST CTC AP203 geometry should import: {error}")
+                }
+            };
+            let again = parse_step_selecting(bytes, imported.selected_shell_entity_id)
+                .expect("repeat NIST CTC import should succeed");
+            assert_eq!(imported.shell_count, 1);
+            assert!(imported.mesh.tris.len() >= 12);
+            assert_eq!(
+                crate::cad::analyzed_mesh_sha256(&imported.mesh),
+                crate::cad::analyzed_mesh_sha256(&again.mesh)
+            );
+        }
+    }
+
+    #[test]
+    fn nist_ftc11_ap203_geom_imports_or_records_honest_ceiling() {
+        let bytes = include_bytes!("../test-geometry/corpus/vendor/nist_ftc11_ap203_geom.step");
+        match parse_step(bytes) {
+            Ok(imported) => {
+                assert_eq!(imported.shell_count, 1);
+                assert!(!imported.mesh.tris.is_empty());
+            }
+            Err(error) => assert!(!error.is_empty()),
+        }
+    }
+
+    #[test]
+    fn nist_tessellated_and_stc_ap242_record_honest_ceiling_or_import() {
+        for bytes in [
+            include_bytes!("../test-geometry/corpus/vendor/nist_stc06_ap242_e3.step").as_slice(),
+            include_bytes!("../test-geometry/corpus/vendor/nist_ftc08_ap242_e1_tessellated.step")
+                .as_slice(),
+        ] {
+            match parse_step(bytes) {
+                Ok(imported) => {
+                    assert_eq!(imported.shell_count, 1);
+                    assert!(!imported.mesh.tris.is_empty());
+                }
+                Err(error) => {
+                    // Faceted/tessellated NIST packs often have no classic B-rep shell.
+                    // Keep the reject visible — this is OCCT-gate evidence.
+                    assert!(!error.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fusion_simple_ap214_imports_deterministically() {
+        let bytes = include_bytes!("../test-geometry/corpus/vendor/fusion_simple_ap214.step");
+        let first = match parse_step_selecting(bytes, None) {
+            Ok(imported) => imported,
+            Err(StepParseError::ChooseShell(choice)) => {
+                let selected = choice.shells[0].entity_id;
+                parse_step_selecting(bytes, Some(selected))
+                    .expect("Fusion multi-shell part should import after pick-one")
+            }
+            Err(StepParseError::Message(error)) => {
+                panic!("Fusion AP214 export should import: {error}")
+            }
+        };
+        let again = parse_step_selecting(bytes, first.selected_shell_entity_id)
+            .expect("repeat Fusion import should succeed");
+        assert_eq!(first.shell_count, 1);
+        assert!(first.mesh.tris.len() >= 12);
+        assert_eq!(
+            crate::cad::analyzed_mesh_sha256(&first.mesh),
+            crate::cad::analyzed_mesh_sha256(&again.mesh)
+        );
+        // Fusion personal export used AUTOMOTIVE_DESIGN (AP214) and millimetre units.
+        assert_eq!(first.declared_unit.as_deref(), Some("mm"));
+    }
+
+    #[test]
+    fn onshape_extra_ap242_imports_deterministically() {
+        let bytes = include_bytes!("../test-geometry/corpus/vendor/onshape_extra_ap242.step");
+        let first = parse_step(bytes).expect("Onshape AP242 extra part should import");
+        let second = parse_step(bytes).expect("repeat Onshape import should succeed");
+        assert_eq!(first.shell_count, 1);
+        assert!(first.mesh.tris.len() >= 12);
+        assert_eq!(first.declared_unit.as_deref(), Some("m"));
+        assert_eq!(
+            crate::cad::analyzed_mesh_sha256(&first.mesh),
+            crate::cad::analyzed_mesh_sha256(&second.mesh)
+        );
+        // Must be a different fixture from the existing curved Onshape part.
+        let existing = include_bytes!("../test-geometry/part_ap242.step");
+        assert_ne!(
+            crate::cad::analyzed_mesh_sha256(&first.mesh),
+            crate::cad::analyzed_mesh_sha256(
+                &parse_step(existing)
+                    .expect("existing Onshape fixture should still import")
+                    .mesh
+            )
+        );
+    }
+
+    #[test]
+    fn solidworks_nist_ctc01_ap214_imports_deterministically() {
+        let bytes =
+            include_bytes!("../test-geometry/corpus/vendor/solidworks_nist_ctc01_ap214.step");
+        let first = match parse_step_selecting(bytes, None) {
+            Ok(imported) => imported,
+            Err(StepParseError::ChooseShell(choice)) => {
+                let selected = choice.shells[0].entity_id;
+                parse_step_selecting(bytes, Some(selected))
+                    .expect("SolidWorks NIST CTC-01 should import after pick-one")
+            }
+            Err(StepParseError::Message(error)) => {
+                panic!("SolidWorks NIST CTC-01 AP214 export should import: {error}")
+            }
+        };
+        let again = parse_step_selecting(bytes, first.selected_shell_entity_id)
+            .expect("repeat SolidWorks import should succeed");
+        assert_eq!(first.shell_count, 1);
+        assert!(first.mesh.tris.len() >= 12);
+        assert_eq!(first.declared_unit.as_deref(), Some("mm"));
+        assert_eq!(
+            crate::cad::analyzed_mesh_sha256(&first.mesh),
+            crate::cad::analyzed_mesh_sha256(&again.mesh)
+        );
     }
 }

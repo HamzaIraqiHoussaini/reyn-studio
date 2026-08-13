@@ -1,6 +1,6 @@
 [package]
 name = "reyn-studio"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Native desktop studio for fluid-flow cases, model results, and evidence"
 
@@ -19,7 +19,7 @@ name = "reyn-cad-bridge"
 path = "src/bin/reyn_cad_bridge.rs"
 
 [dependencies]
-eframe = { version = "0.35", default-features = false, features = ["wgpu", "default_fonts", "persistence"] }
+eframe = { version = "0.35", default-features = false, features = ["wgpu", "default_fonts", "persistence", "accesskit"] }
 egui = "0.35"
 bytemuck = { version = "1", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -47,7 +47,10 @@ muda = "0.19.3"
 security-framework = { version = "3.7", features = ["OSX_10_15"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_UI_Shell"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Credentials", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_UI_Shell"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["linux-native"] }
 
 [build-dependencies]
 winres = "0.1.12"

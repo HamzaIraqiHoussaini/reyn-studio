@@ -36,6 +36,7 @@ pub enum MenuCommand {
     ToggleSandboxLive,
     OpenDocs,
     CheckForUpdates,
+    SignOut,
 }
 
 pub enum MenuSignal {
@@ -111,6 +112,8 @@ impl MenuBar {
                         ..Default::default()
                     }),
                 ),
+                &PredefinedMenuItem::separator(),
+                &item("Sign Out…", None, MenuCommand::SignOut),
                 &PredefinedMenuItem::separator(),
                 &PredefinedMenuItem::services(None),
                 &PredefinedMenuItem::separator(),

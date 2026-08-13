@@ -348,6 +348,11 @@ impl Camera {
         !done
     }
 
+    /// True while a Fit / station glide is still interpolating.
+    pub fn is_animating(&self) -> bool {
+        self.anim.is_some()
+    }
+
     /// Eye position in solver-domain coordinates.
     pub fn eye(&self) -> [f32; 3] {
         let (cp, sp) = (self.pitch.cos(), self.pitch.sin());
@@ -539,11 +544,15 @@ pub const ANALYTIC_STREAMLINE_LABEL: &str =
 pub const MODEL_STREAMLINE_LABEL: &str = "MODEL · streamlines from predicted velocity";
 
 /// Dense velocity volume for engineering streamlines: `vel` is `[3,N,N,N]` in
-/// domain coordinates, same layout as `engine::CadField.vel`.
+/// domain coordinates, same layout as `engine::CadField.vel`
+/// (`((c*N+i)*N+j)*N+k`). Optional `mask` is the stored solid occupancy on the
+/// same `(i,j,k)` grid — used to terminate ribbons at the body so Brinkman
+/// leakage cannot draw air through the solid.
 #[derive(Clone)]
 pub struct ModelVelocityField {
     pub n: usize,
     pub vel: std::sync::Arc<[f32]>,
+    pub mask: Option<std::sync::Arc<[f32]>>,
 }
 
 /// A billboarded critical-point annotation: fixed screen-size ring + value chip
@@ -820,8 +829,9 @@ pub fn show(
         cam.zoom(scroll, None, rect, opts.invert_scroll_zoom);
     }
 
-    // Volume raymarch mode: hand the whole 3D field to the GPU and return. The
-    // orbit camera becomes a ray origin looking at its target.
+    // Volume raymarch mode: body/surface (+ optional volume) on the GPU, then
+    // composite honest model streamlines and markers on top. Early-returning
+    // here used to drop engineering streamlines entirely on Results.
     if opts.gpu && opts.volume_mode && !opts.mode2d {
         let eye = cam.eye();
         let slice_c = [
@@ -829,6 +839,26 @@ pub fn show(
             opts.slice[1].map(|p| p * 2.0 - 1.0).unwrap_or(-2.0),
             opts.slice[2].map(|p| p * 2.0 - 1.0).unwrap_or(-2.0),
         ];
+        let use_model = model_streamlines(
+            opts.streamlines,
+            opts.model_velocity.is_some() && !opts.research_sandbox,
+        );
+        let segments = if use_model {
+            if let Some(field) = opts.model_velocity.as_ref() {
+                let ppp = ui.ctx().pixels_per_point();
+                let project = |v: [f32; 3]| -> (Pos2, f32) {
+                    match cam.project(rect, v) {
+                        Some((screen, depth)) => (screen, depth),
+                        None => (Pos2::new(f32::MAX, f32::MAX), -1.0),
+                    }
+                };
+                model_streamline_segments(&project, field, opts.fit_bounds, eye, rect, ppp)
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
         gpu::add_volume(
             ui,
             rect,
@@ -841,7 +871,18 @@ pub fn show(
             opts.shadows,
             opts.volume.clone(),
             opts.surface.clone(),
+            segments,
         );
+        if use_model {
+            let p = ui.painter_at(rect);
+            p.text(
+                rect.left_top() + egui::vec2(16.0, rect.height() - 44.0),
+                egui::Align2::LEFT_TOP,
+                MODEL_STREAMLINE_LABEL,
+                mono_s().resolve(ui.style()),
+                GOLD,
+            );
+        }
         draw_markers(ui, rect, cam, opts, None); // billboards over the raymarch
         return interaction;
     }
@@ -985,7 +1026,7 @@ pub fn show(
             streamline_segments(&project, particles, rect, ppp)
         } else if use_model {
             if let Some(field) = opts.model_velocity.as_ref() {
-                model_streamline_segments(&project, field, rect, ppp)
+                model_streamline_segments(&project, field, opts.fit_bounds, cam.eye(), rect, ppp)
             } else {
                 Vec::new()
             }
@@ -1017,7 +1058,7 @@ pub fn show(
             }
         } else if use_model {
             if let Some(field) = opts.model_velocity.as_ref() {
-                for poly in model_streamline_polys(&project, field) {
+                for (poly, _) in model_streamline_polys(&project, field, opts.fit_bounds) {
                     p.line(poly, Stroke::new(1.2, BRAND.gamma_multiply(0.75)));
                 }
             }
@@ -1054,56 +1095,177 @@ fn sample_model_velocity(field: &ModelVelocityField, pos: [f32; 3]) -> [f32; 3] 
     let ix = to_index(pos[0]) as usize;
     let iy = to_index(pos[1]) as usize;
     let iz = to_index(pos[2]) as usize;
-    let cube = n * n * n;
+    // CadField / flow.rs layout: ((c * N + i) * N + j) * N + k
     let at = |component: usize, x: usize, y: usize, z: usize| {
         field
             .vel
-            .get(component * cube + z * n * n + y * n + x)
+            .get(((component * n + x) * n + y) * n + z)
             .copied()
             .unwrap_or(0.0)
     };
     [at(0, ix, iy, iz), at(1, ix, iy, iz), at(2, ix, iy, iz)]
 }
 
+/// Solid occupancy in `[0,1]` at a domain point. Missing mask → always fluid.
+fn sample_model_mask(field: &ModelVelocityField, pos: [f32; 3]) -> f32 {
+    let Some(mask) = field.mask.as_ref() else {
+        return 0.0;
+    };
+    let n = field.n.max(2);
+    let to_index =
+        |coordinate: f32| ((coordinate + 1.0) * 0.5 * (n - 1) as f32).clamp(0.0, (n - 1) as f32);
+    let ix = to_index(pos[0]) as usize;
+    let iy = to_index(pos[1]) as usize;
+    let iz = to_index(pos[2]) as usize;
+    mask.get((ix * n + iy) * n + iz).copied().unwrap_or(0.0)
+}
+
+/// Display-solid threshold: matches the Cp surface shell floor so streamlines
+/// stop where the raymarch draws the body, not deeper in the Brinkman core.
+const STREAMLINE_SOLID: f32 = 0.20;
+
+/// Upstream rake sized from the body AABB when available; otherwise a fixed
+/// free-stream half-domain rake. Seeds sit slightly ahead of the body so tubes
+/// wrap the solid rather than starting inside it.
+fn model_streamline_seeds(fit_bounds: Option<([f32; 3], [f32; 3])>) -> Vec<[f32; 3]> {
+    let (x0, y0, y1, z0, z1) = if let Some((lo, hi)) = fit_bounds {
+        let cy = 0.5 * (lo[1] + hi[1]);
+        let cz = 0.5 * (lo[2] + hi[2]);
+        // Slightly oversized frontal rake so edge streamlines clear the sides.
+        let hy = ((hi[1] - lo[1]) * 0.95).max(0.28);
+        let hz = ((hi[2] - lo[2]) * 0.95).max(0.28);
+        let x = (lo[0] - 0.32).clamp(-0.95, -0.30);
+        (x, cy - hy, cy + hy, cz - hz, cz + hz)
+    } else {
+        (-0.85, -0.70, 0.70, -0.70, 0.70)
+    };
+    let mut seeds = Vec::with_capacity(64);
+    for j in 0..8 {
+        for k in 0..8 {
+            let ty = j as f32 / 7.0;
+            let tz = k as f32 / 7.0;
+            seeds.push([x0, y0 + (y1 - y0) * ty, z0 + (z1 - z0) * tz]);
+        }
+    }
+    seeds
+}
+
+fn speed_rgb(speed: f32) -> [f32; 3] {
+    // Ember sequential on nondimensional |u|/V∞ (≈1 freestream).
+    let t = (speed * 0.55).clamp(0.0, 1.0);
+    [0.28 + 0.62 * t, 0.14 + 0.32 * t, 0.05 + 0.10 * t]
+}
+
+/// True when the camera ray from `eye` to `point` hits the solid before the
+/// sample — used so screen-space tubes do not paint through the Cp body.
+fn occluded_by_solid(field: &ModelVelocityField, eye: [f32; 3], point: [f32; 3]) -> bool {
+    if field.mask.is_none() {
+        return false;
+    }
+    let delta = [
+        point[0] - eye[0],
+        point[1] - eye[1],
+        point[2] - eye[2],
+    ];
+    let dist = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2])
+        .sqrt()
+        .max(1e-4);
+    let steps = ((dist / 0.06).ceil() as usize).clamp(8, 28);
+    for i in 1..steps {
+        let t = i as f32 / steps as f32 * 0.92;
+        let p = [
+            eye[0] + delta[0] * t,
+            eye[1] + delta[1] * t,
+            eye[2] + delta[2] * t,
+        ];
+        if sample_model_mask(field, p) >= STREAMLINE_SOLID {
+            return true;
+        }
+    }
+    false
+}
+
+/// Integrate model velocity with RK2 arc-length steps in domain coordinates.
+/// Ribbons terminate on the solid mask so Brinkman leakage cannot draw
+/// through-body flow.
+fn model_streamline_traces(
+    field: &ModelVelocityField,
+    fit_bounds: Option<([f32; 3], [f32; 3])>,
+) -> Vec<(Vec<[f32; 3]>, Vec<f32>)> {
+    let seeds = model_streamline_seeds(fit_bounds);
+    let h = 0.032;
+    let steps = 48usize;
+    let mut traces = Vec::with_capacity(seeds.len());
+    for seed in seeds {
+        if sample_model_mask(field, seed) >= STREAMLINE_SOLID {
+            continue;
+        }
+        let mut pos = seed;
+        let mut trace = Vec::with_capacity(steps);
+        let mut speeds = Vec::with_capacity(steps);
+        for _ in 0..steps {
+            if sample_model_mask(field, pos) >= STREAMLINE_SOLID {
+                break;
+            }
+            let v0 = sample_model_velocity(field, pos);
+            let sp0 = (v0[0] * v0[0] + v0[1] * v0[1] + v0[2] * v0[2])
+                .sqrt()
+                .max(1e-4);
+            if sp0 < 0.04 {
+                trace.push(pos);
+                speeds.push(sp0);
+                break;
+            }
+            trace.push(pos);
+            speeds.push(sp0);
+            let mut mid = [0.0f32; 3];
+            for a in 0..3 {
+                mid[a] = (pos[a] + v0[a] / sp0 * (h * 0.5)).clamp(-1.0, 1.0);
+            }
+            if sample_model_mask(field, mid) >= STREAMLINE_SOLID {
+                break;
+            }
+            let v1 = sample_model_velocity(field, mid);
+            let sp1 = (v1[0] * v1[0] + v1[1] * v1[1] + v1[2] * v1[2])
+                .sqrt()
+                .max(1e-4);
+            let mut next = [0.0f32; 3];
+            for a in 0..3 {
+                next[a] = (pos[a] + v1[a] / sp1 * h).clamp(-1.0, 1.0);
+            }
+            if sample_model_mask(field, next) >= STREAMLINE_SOLID {
+                break;
+            }
+            pos = next;
+        }
+        if trace.len() >= 2 {
+            traces.push((trace, speeds));
+        }
+    }
+    traces
+}
+
 fn model_streamline_polys(
     project: &impl Fn([f32; 3]) -> (Pos2, f32),
     field: &ModelVelocityField,
-) -> Vec<Vec<Pos2>> {
-    let n = field.n.max(2);
-    let mut seeds = Vec::new();
-    // Seed a rake of streamwise lines ahead of the body in the free-stream half.
-    for j in 0..6 {
-        for k in 0..6 {
-            let y = -0.6 + j as f32 * 0.24;
-            let z = -0.6 + k as f32 * 0.24;
-            seeds.push([-0.85, y, z]);
-        }
-    }
-    let _ = n;
-    let mut polys = Vec::with_capacity(seeds.len());
-    for seed in seeds {
-        let mut pos = seed;
-        let mut poly = Vec::with_capacity(32);
-        for _ in 0..32 {
-            poly.push(project(pos).0);
-            let velocity = sample_model_velocity(field, pos);
-            let speed =
-                (velocity[0] * velocity[0] + velocity[1] * velocity[1] + velocity[2] * velocity[2])
-                    .sqrt()
-                    .max(1e-4);
-            let step = 0.035 / speed;
-            for axis in 0..3 {
-                pos[axis] = (pos[axis] + velocity[axis] * step).clamp(-1.0, 1.0);
-            }
-        }
-        polys.push(poly);
-    }
-    polys
+    fit_bounds: Option<([f32; 3], [f32; 3])>,
+) -> Vec<(Vec<Pos2>, Vec<f32>)> {
+    model_streamline_traces(field, fit_bounds)
+        .into_iter()
+        .map(|(trace, speeds)| {
+            (
+                trace.into_iter().map(|p| project(p).0).collect(),
+                speeds,
+            )
+        })
+        .collect()
 }
 
 fn model_streamline_segments(
     project: &impl Fn([f32; 3]) -> (Pos2, f32),
     field: &ModelVelocityField,
+    fit_bounds: Option<([f32; 3], [f32; 3])>,
+    eye: [f32; 3],
     rect: Rect,
     ppp: f32,
 ) -> Vec<SegInstance> {
@@ -1114,14 +1276,28 @@ fn model_streamline_segments(
         ]
     };
     let mut segments = Vec::new();
-    for poly in model_streamline_polys(project, field) {
-        for window in poly.windows(2) {
+    for (trace, speeds) in model_streamline_traces(field, fit_bounds) {
+        for i in 0..trace.len().saturating_sub(1) {
+            let mid = [
+                0.5 * (trace[i][0] + trace[i + 1][0]),
+                0.5 * (trace[i][1] + trace[i + 1][1]),
+                0.5 * (trace[i][2] + trace[i + 1][2]),
+            ];
+            if occluded_by_solid(field, eye, mid) {
+                continue;
+            }
+            let (s0, _) = project(trace[i]);
+            let (s1, _) = project(trace[i + 1]);
+            if s0.x > 1.0e20 || s1.x > 1.0e20 {
+                continue;
+            }
+            let rgb = speed_rgb(0.5 * (speeds[i] + speeds[i + 1]));
             segments.push(SegInstance {
-                p0: to_ndc(window[0]),
-                p1: to_ndc(window[1]),
-                width_px: 1.6 * ppp,
+                p0: to_ndc(s0),
+                p1: to_ndc(s1),
+                width_px: 3.0 * ppp,
                 _pad: 0.0,
-                color: [0.85, 0.42, 0.18, 1.0],
+                color: [rgb[0], rgb[1], rgb[2], 1.0],
             });
         }
     }
@@ -1568,5 +1744,111 @@ mod tests {
         assert!(!analytic_streamlines(false, true));
         assert!(analytic_streamlines(true, true));
         assert!(ANALYTIC_STREAMLINE_LABEL.contains("not model velocity"));
+    }
+
+    #[test]
+    fn model_streamlines_gate_requires_velocity_and_toggle() {
+        assert!(!model_streamlines(false, true));
+        assert!(!model_streamlines(true, false));
+        assert!(model_streamlines(true, true));
+    }
+
+    #[test]
+    fn sample_model_velocity_uses_cad_field_axis_order() {
+        // CadField layout is ((c*N+i)*N+j)*N+k — not z-major.
+        let n = 4usize;
+        let mut vel = vec![0.0f32; 3 * n * n * n];
+        let mut set = |c: usize, i: usize, j: usize, k: usize, v: f32| {
+            vel[((c * n + i) * n + j) * n + k] = v;
+        };
+        set(0, 3, 1, 2, 7.0);
+        set(1, 3, 1, 2, 8.0);
+        set(2, 3, 1, 2, 9.0);
+        let field = ModelVelocityField {
+            n,
+            vel: vel.into(),
+            mask: None,
+        };
+        // Domain point for voxel (3,1,2) on a 4³ grid.
+        let pos = [
+            3.0 / 3.0 * 2.0 - 1.0,
+            1.0 / 3.0 * 2.0 - 1.0,
+            2.0 / 3.0 * 2.0 - 1.0,
+        ];
+        let sample = sample_model_velocity(&field, pos);
+        assert_eq!(sample, [7.0, 8.0, 9.0]);
+    }
+
+    #[test]
+    fn model_streamlines_terminate_inside_the_solid_mask() {
+        let n = 8usize;
+        let cube = n * n * n;
+        let mut vel = vec![0.0f32; 3 * cube];
+        let mut mask = vec![0.0f32; cube];
+        // Uniform +X freestream plus a solid brick in the middle.
+        for i in 0..n {
+            for j in 0..n {
+                for k in 0..n {
+                    vel[((0 * n + i) * n + j) * n + k] = 1.0;
+                    if (3..5).contains(&i) && (3..5).contains(&j) && (3..5).contains(&k) {
+                        mask[(i * n + j) * n + k] = 1.0;
+                    }
+                }
+            }
+        }
+        let field = ModelVelocityField {
+            n,
+            vel: vel.into(),
+            mask: Some(mask.into()),
+        };
+        let project = |p: [f32; 3]| (Pos2::new(p[0], p[1]), 0.0);
+        let brick_center = [
+            3.5 / 7.0 * 2.0 - 1.0,
+            3.5 / 7.0 * 2.0 - 1.0,
+            3.5 / 7.0 * 2.0 - 1.0,
+        ];
+        assert!(sample_model_mask(&field, brick_center) >= STREAMLINE_SOLID);
+        assert_eq!(sample_model_velocity(&field, [-0.8, 0.0, 0.0]), [1.0, 0.0, 0.0]);
+        assert!(occluded_by_solid(
+            &field,
+            [-0.9, 0.0, 0.0],
+            [0.9, 0.0, 0.0]
+        ));
+        assert!(!occluded_by_solid(
+            &field,
+            [-0.9, 0.8, 0.8],
+            [-0.4, 0.8, 0.8]
+        ));
+        let polys = model_streamline_polys(
+            &project,
+            &field,
+            Some(([-0.05, -0.02, -0.02], [0.05, 0.02, 0.02])),
+        );
+        assert!(!polys.is_empty());
+        assert!(
+            polys.iter().any(|(poly, _)| poly.len() >= 2 && poly.len() < 48),
+            "at least the seeds that strike the brick must terminate"
+        );
+        let brick_face = 3.0 / 7.0 * 2.0 - 1.0;
+        let hitting = polys.iter().filter(|(poly, _)| poly.len() < 48);
+        for (poly, _) in hitting {
+            let max_x = poly.iter().map(|p| p.x).fold(f32::NEG_INFINITY, f32::max);
+            assert!(
+                max_x < brick_face + 0.12,
+                "terminated ribbon still entered the solid (max x {max_x}, brick {brick_face})"
+            );
+        }
+    }
+
+    #[test]
+    fn volume_mode_composites_model_streamlines_when_gated_on() {
+        // Engineering Results uses volume raymarch + model tubes together.
+        // The gate itself must stay independent of volume_mode so the volume
+        // branch can composite streamlines after gpu::add_volume.
+        assert!(model_streamlines(true, true));
+        assert!(!analytic_streamlines(true, false));
+        let seeds = model_streamline_seeds(Some(([-0.2, -0.1, -0.1], [0.2, 0.1, 0.1])));
+        assert_eq!(seeds.len(), 64);
+        assert!(seeds.iter().all(|p| p[0] < -0.2));
     }
 }

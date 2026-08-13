@@ -104,6 +104,32 @@ def _fd_poisson(rhs, dx, periodic, tol, max_iter):
 SURFACE_LOAD_METHOD = "diffuse_interface_traction.v1"
 
 
+def derive_model_qualification_class(version, limitations, status):
+    """Mirror Studio's fail-closed release class for model cards."""
+    version_text = str(version or "").strip().lower()
+    limitation_blob = "\n".join(str(item).lower() for item in (limitations or []))
+    if (
+        "yc-preview" in version_text
+        or "preview" in version_text
+        or "not production-qualified" in limitation_blob
+        or "yc research preview" in limitation_blob
+    ):
+        return "preview"
+    if (
+        "research" in limitation_blob
+        or "not production" in limitation_blob
+        or "research" in version_text
+    ):
+        return "research"
+    if (
+        status == "clean"
+        and "incomplete" not in limitation_blob
+        and "preview" not in limitation_blob
+    ):
+        return "production"
+    return "unknown"
+
+
 def engineering_surface_loads(
     velocity,
     recovered_pressure,
@@ -115,6 +141,9 @@ def engineering_surface_loads(
     velocity_mps,
     density_kg_m3,
     reference_pressure_pa,
+    moment_origin_mode="diffuse_surface_centroid",
+    moment_origin_solver=None,
+    reference_area_m2=None,
 ):
     """Convert a nondimensional fixed-body result into versioned fluid loads.
 
@@ -194,10 +223,32 @@ def engineering_surface_loads(
         np.meshgrid(grid, grid, grid, indexing="ij"), axis=0
     )
     area_sum = max(float(area_weight.sum()), 1e-12)
-    center = np.sum(
+    surface_centroid = np.sum(
         coordinates * area_weight[None], axis=(1, 2, 3)
     ) / area_sum
-    arm = coordinates - center[:, None, None, None]
+    mode = str(moment_origin_mode or "diffuse_surface_centroid").strip().lower()
+    if mode in ("", "diffuse_surface_centroid", "diffuse-surface_centroid"):
+        mode = "diffuse_surface_centroid"
+        moment_origin = surface_centroid.copy()
+        moment_warning = (
+            "Reported moments use the diffuse-surface area centroid as the reference origin."
+        )
+    elif mode in ("source_frame_point", "source-frame_point"):
+        mode = "source_frame_point"
+        if moment_origin_solver is None:
+            raise ValueError(
+                "source_frame_point moment origin requires moment_origin_solver"
+            )
+        moment_origin = np.asarray(moment_origin_solver, dtype=np.float64).reshape(3)
+        if not np.all(np.isfinite(moment_origin)):
+            raise ValueError("moment_origin_solver must be finite")
+        moment_warning = (
+            "Reported moments use the operator-declared source-frame point "
+            "(CG / moment origin) mapped into solver coordinates."
+        )
+    else:
+        raise ValueError(f"unsupported moment_origin_mode: {moment_origin_mode!r}")
+    arm = coordinates - moment_origin[:, None, None, None]
     moment_density = np.cross(
         np.moveaxis(arm, 0, -1),
         np.moveaxis(traction_normalized, 0, -1),
@@ -206,8 +257,10 @@ def engineering_surface_loads(
         np.moveaxis(moment_density, -1, 0) * area_weight[None],
         axis=(1, 2, 3),
     )
-    force_coefficients = force / (0.5 * char_len_solver**2)
-    moment_coefficients = moment / (0.5 * char_len_solver**3)
+    # Dimensional loads always scale with L_ref from the nondimensional solver
+    # integrals. Coefficient reporting may optionally use an aero reference area.
+    force_scale = force / (0.5 * char_len_solver**2)
+    moment_scale = moment / (0.5 * char_len_solver**3)
 
     dynamic_pressure = 0.5 * density_kg_m3 * velocity_mps**2
     pressure_delta_pa = pressure * density_kg_m3 * velocity_mps**2
@@ -217,15 +270,25 @@ def engineering_surface_loads(
         + pressure_delta_pa
     )
     traction_pa = traction_normalized * density_kg_m3 * velocity_mps**2
-    force_newtons = (
-        force_coefficients * dynamic_pressure * reference_length_m**2
-    )
-    moment_newton_meters = (
-        moment_coefficients * dynamic_pressure * reference_length_m**3
-    )
+    force_newtons = force_scale * dynamic_pressure * reference_length_m**2
+    moment_newton_meters = moment_scale * dynamic_pressure * reference_length_m**3
     surface_area_m2 = (
         area_sum * (reference_length_m / char_len_solver) ** 2
     )
+    aero_area = None
+    if reference_area_m2 is not None:
+        aero_area = float(reference_area_m2)
+        if not math.isfinite(aero_area) or aero_area <= 0.0:
+            raise ValueError("reference_area_m2 must be finite and positive when set")
+        force_coefficients = force_newtons / (dynamic_pressure * aero_area)
+        moment_coefficients = moment_newton_meters / (
+            dynamic_pressure * aero_area * reference_length_m
+        )
+        coefficient_reference = "q_inf * A_ref ; q_inf * A_ref * L_ref"
+    else:
+        force_coefficients = force_scale
+        moment_coefficients = moment_scale
+        coefficient_reference = "q_inf * L_ref^2 ; q_inf * L_ref^3"
 
     surface = surface_density > max(float(surface_density.max()) * 0.05, 1e-8)
     if not np.any(surface):
@@ -236,17 +299,18 @@ def engineering_surface_loads(
     suction_hotspot = surface_indices[int(np.argmin(surface_cp))]
     to_physical = reference_length_m / char_len_solver
     load_hotspot_m = (
-        (load_hotspot.astype(np.float64) + 0.5) * dx - center
+        (load_hotspot.astype(np.float64) + 0.5) * dx - moment_origin
     ) * to_physical
     suction_hotspot_m = (
-        (suction_hotspot.astype(np.float64) + 0.5) * dx - center
+        (suction_hotspot.astype(np.float64) + 0.5) * dx - moment_origin
     ) * to_physical
     divergence = sum(
         derivative(velocity[axis], axis) for axis in range(3)
     )
     divergence_rms = float(np.sqrt(np.mean(divergence**2)))
     speed = np.linalg.norm(velocity, axis=0)
-    body_x = float(center[0])
+    # Wake detection stays geometric (surface centroid), not CG-relative.
+    body_x = float(surface_centroid[0])
     wake_region = (coordinates[0] > body_x + 0.5 * char_len_solver) & (mask < 0.1)
     wake_deficit = np.maximum(0.0, 1.0 - speed)
     if np.any(wake_region):
@@ -263,7 +327,7 @@ def engineering_surface_loads(
     warnings = [
         "Pressure is recovered from the predicted velocity field; it is model-derived, not a solver reference.",
         "Diffuse-interface tractions are fluid loads for downstream FEA mapping, not structural stress.",
-        "Reported moments use the diffuse-surface area centroid as the reference origin.",
+        moment_warning,
     ]
     return {
         "method": SURFACE_LOAD_METHOD,
@@ -283,6 +347,11 @@ def engineering_surface_loads(
         "wake_deficit_mean": wake_deficit_mean,
         "cp_min": float(surface_cp.min()),
         "cp_max": float(surface_cp.max()),
+        "moment_origin_mode": mode,
+        "moment_origin_solver": moment_origin.astype(float).tolist(),
+        "surface_centroid_solver": surface_centroid.astype(float).tolist(),
+        "coefficient_reference": coefficient_reference,
+        "reference_area_m2": aero_area,
         "warnings": warnings,
     }
 
@@ -660,6 +729,10 @@ class Engine:
             loaded = load_model_bundle(
                 path,
                 trusted_state_dir=self.model_trust_state_dir,
+                development_allow_unsigned=os.environ.get(
+                    "REYN_MODEL_DEVELOPMENT_UNSIGNED", ""
+                ).strip().lower()
+                in {"1", "true", "yes"},
             )
             manifest = loaded.manifest
             authenticity = loaded.authenticity
@@ -745,6 +818,12 @@ class Engine:
                 "limitations": list(manifest["limitations"]),
                 "benchmark_report_hashes": list(manifest["benchmark_reports"]),
                 "unknown_fields": unknown_fields,
+                "version": str(manifest.get("model", {}).get("version", "")),
+                "qualification_class": derive_model_qualification_class(
+                    manifest.get("model", {}).get("version", ""),
+                    manifest.get("limitations", []),
+                    status,
+                ),
                 "fact_sources": {
                     "dimension": "verified_bundle_manifest_and_tensor_schema",
                     "grid": "verified_bundle_manifest",
@@ -1057,6 +1136,11 @@ class Engine:
                 "limitations": limitations,
                 "benchmark_report_hashes": report_hashes,
                 "unknown_fields": unknown_fields,
+                "qualification_class": derive_model_qualification_class(
+                    checkpoint.get("model_version") or path.name,
+                    limitations,
+                    status,
+                ),
                 "fact_sources": {
                     "dimension": "inspected_state_dict",
                     "grid": "checkpoint_metadata" if grid else "unknown",
@@ -1265,6 +1349,10 @@ class Engine:
         loaded = load_model_bundle(
             bundle_path,
             trusted_state_dir=self.model_trust_state_dir,
+            development_allow_unsigned=os.environ.get(
+                "REYN_MODEL_DEVELOPMENT_UNSIGNED", ""
+            ).strip().lower()
+            in {"1", "true", "yes"},
         )
         manifest = loaded.manifest
         m = loaded.model
@@ -1636,6 +1724,13 @@ class Engine:
         velocity_mps = float(req.get("velocity_mps", 1.0))
         density_kg_m3 = float(req.get("density_kg_m3", 1.225))
         reference_pressure_pa = float(req.get("reference_pressure_pa", 101325.0))
+        moment_origin_mode = str(
+            req.get("moment_origin_mode", "diffuse_surface_centroid")
+        )
+        moment_origin_solver = req.get("moment_origin_solver")
+        reference_area_m2 = req.get("reference_area_m2")
+        if reference_area_m2 is not None:
+            reference_area_m2 = float(reference_area_m2)
         engineering_values = {
             "Reynolds number": reynolds,
             "reference length": reference_length_m,
@@ -1718,6 +1813,9 @@ class Engine:
             velocity_mps=velocity_mps,
             density_kg_m3=density_kg_m3,
             reference_pressure_pa=reference_pressure_pa,
+            moment_origin_mode=moment_origin_mode,
+            moment_origin_solver=moment_origin_solver,
+            reference_area_m2=reference_area_m2,
         )
         report("recovering", 4, "Surface loads integrated", 1.0)
         out = np.concatenate(
@@ -1750,6 +1848,11 @@ class Engine:
                 "divergence_rms": loads["divergence_rms"],
                 "wake_deficit_peak": loads["wake_deficit_peak"],
                 "wake_deficit_mean": loads["wake_deficit_mean"],
+                "moment_origin_mode": loads["moment_origin_mode"],
+                "moment_origin_solver": loads["moment_origin_solver"],
+                "surface_centroid_solver": loads["surface_centroid_solver"],
+                "coefficient_reference": loads["coefficient_reference"],
+                "reference_area_m2": loads["reference_area_m2"],
                 "load_method": loads["method"],
                 "warnings": loads["warnings"]}
         return out.reshape(-1), meta

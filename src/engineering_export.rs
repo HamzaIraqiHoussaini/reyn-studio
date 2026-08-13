@@ -522,6 +522,7 @@ mod tests {
                 horizon_steps: 8,
                 ..OperatingPoint::default()
             },
+            review_focus: crate::engineering::ReviewFocus::default(),
             result: Some(EngineeringResult {
                 method: "diffuse_interface_traction.v1".into(),
                 cp_min: -1.62,
@@ -537,8 +538,10 @@ mod tests {
                 divergence_rms: 2.1e-3,
                 wake_deficit_peak: 0.45,
                 wake_deficit_mean: 0.12,
+                moment_origin_mode: "diffuse_surface_centroid".into(),
                 semigroup: Some(0.015),
                 warnings: vec!["horizon near support limit".into()],
+                ..Default::default()
             }),
             parent_run_id: None,
             named_regions: Vec::new(),

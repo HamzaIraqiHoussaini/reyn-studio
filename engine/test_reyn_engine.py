@@ -227,6 +227,60 @@ class EngineeringSurfaceLoadTests(unittest.TestCase):
         )
         self.assertAlmostEqual(result["force_newtons"][0], expected, places=5)
         self.assertEqual(result["traction_pa"].shape, velocity.shape)
+        self.assertEqual(result["moment_origin_mode"], "diffuse_surface_centroid")
+        self.assertEqual(
+            result["coefficient_reference"],
+            "q_inf * L_ref^2 ; q_inf * L_ref^3",
+        )
+
+    def test_source_frame_moment_origin_and_reference_area_override(self):
+        velocity, mask = self.synthetic_cube()
+        x = np.linspace(0.5, -0.5, mask.shape[0], dtype=np.float32)
+        pressure = np.broadcast_to(x[:, None, None], mask.shape).copy()
+        baseline = engineering_surface_loads(
+            velocity,
+            pressure,
+            mask,
+            reynolds=150.0,
+            char_len_solver=0.6,
+            reference_length_m=0.2,
+            velocity_mps=20.0,
+            density_kg_m3=1.0,
+            reference_pressure_pa=100000.0,
+        )
+        pinned = engineering_surface_loads(
+            velocity,
+            pressure,
+            mask,
+            reynolds=150.0,
+            char_len_solver=0.6,
+            reference_length_m=0.2,
+            velocity_mps=20.0,
+            density_kg_m3=1.0,
+            reference_pressure_pa=100000.0,
+            moment_origin_mode="source_frame_point",
+            moment_origin_solver=[0.0, 0.0, 0.0],
+            reference_area_m2=0.05,
+        )
+        self.assertEqual(pinned["moment_origin_mode"], "source_frame_point")
+        self.assertEqual(pinned["moment_origin_solver"], [0.0, 0.0, 0.0])
+        self.assertEqual(pinned["reference_area_m2"], 0.05)
+        self.assertEqual(
+            pinned["coefficient_reference"],
+            "q_inf * A_ref ; q_inf * A_ref * L_ref",
+        )
+        np.testing.assert_allclose(
+            pinned["force_newtons"], baseline["force_newtons"], rtol=1e-6, atol=1e-9
+        )
+        q = 0.5 * 1.0 * 20.0**2
+        expected_cx = pinned["force_newtons"][0] / (q * 0.05)
+        self.assertAlmostEqual(pinned["force_coefficients"][0], expected_cx, places=5)
+        self.assertFalse(
+            np.allclose(
+                pinned["moment_newton_meters"],
+                baseline["moment_newton_meters"],
+            )
+        )
 
     def test_malformed_or_nonphysical_contract_is_rejected(self):
         velocity, mask = self.synthetic_cube(16)

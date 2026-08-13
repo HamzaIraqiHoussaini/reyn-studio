@@ -93,7 +93,7 @@ impl SectionQuantity {
         match self {
             Self::RecoveredPressure => "RECOVERED · model-predicted velocity",
             Self::PhysicalCp => "DERIVED · recovered pressure + operating point",
-            Self::VelocityMagnitude => "MODEL PREDICTION · active engineering result",
+            Self::VelocityMagnitude => "MODEL PREDICTION · LIC texture on recorded velocity",
             Self::VorticityMagnitude => "DERIVED · model-predicted velocity",
             Self::FluidTractionMagnitude => "DERIVED FLUID LOAD · diffuse interface",
             Self::WakeDeficit => "DERIVED · model-predicted velocity",
@@ -106,7 +106,9 @@ impl SectionQuantity {
                 "3D spectral Poisson recovery; recorded physical p∞, ρ∞, and V∞"
             }
             Self::PhysicalCp => "Cp=(p_recovered-p∞)/(0.5 ρ∞ V∞²)",
-            Self::VelocityMagnitude => "DirectFlowMap fixed-body prediction; scaled by recorded V∞",
+            Self::VelocityMagnitude => {
+                "DirectFlowMap fixed-body prediction; scaled by recorded V∞; planar LIC"
+            }
             Self::VorticityMagnitude => {
                 "periodic central-difference curl on the 2π solver grid; physical scaling"
             }
@@ -199,6 +201,9 @@ pub struct SectionPlane {
     /// The stored diffuse geometry mask in exactly the same orientation as `values`.
     pub mask: Vec<f32>,
     pub scale: SectionScale,
+    /// In-plane velocity `(u_horizontal, u_vertical)` in section pixel axes for
+    /// velocity LIC. Present only for [`SectionQuantity::VelocityMagnitude`].
+    pub in_plane: Option<Vec<[f32; 2]>>,
 }
 
 impl SectionPlane {
@@ -332,6 +337,11 @@ pub fn extract_section(
 
     let mut values = Vec::with_capacity(n * n);
     let mut mask = Vec::with_capacity(n * n);
+    let mut in_plane = if quantity == SectionQuantity::VelocityMagnitude {
+        Some(Vec::with_capacity(n * n))
+    } else {
+        None
+    };
     for row in 0..n {
         for column in 0..n {
             let [x, y, z] = coordinate(row, column);
@@ -340,13 +350,21 @@ pub fn extract_section(
                 SectionQuantity::RecoveredPressure => input.pressure_pa[voxel],
                 SectionQuantity::PhysicalCp => input.cp[voxel],
                 SectionQuantity::VelocityMagnitude | SectionQuantity::WakeDeficit => {
-                    let speed = (0..3)
-                        .map(|component_index| {
-                            component(input.velocity, component_index, voxel).powi(2)
-                        })
-                        .sum::<f32>()
-                        .sqrt();
+                    let ux = component(input.velocity, 0, voxel);
+                    let uy = component(input.velocity, 1, voxel);
+                    let uz = component(input.velocity, 2, voxel);
+                    let speed = (ux * ux + uy * uy + uz * uz).sqrt();
                     if quantity == SectionQuantity::VelocityMagnitude {
+                        if let Some(plane) = in_plane.as_mut() {
+                            // Section image: +column = horizontal axis, +row =
+                            // downward (decreasing vertical-axis coordinate).
+                            let (uh, uv) = match axis {
+                                SectionAxis::X => (uy, -uz),
+                                SectionAxis::Y => (ux, -uz),
+                                SectionAxis::Z => (ux, -uy),
+                            };
+                            plane.push([uh, uv]);
+                        }
                         speed * input.free_stream_mps
                     } else {
                         (1.0 - speed).max(0.0)
@@ -415,7 +433,56 @@ pub fn extract_section(
             center,
             extent,
         },
+        in_plane,
     })
+}
+
+/// Cheap CPU line-integral convolution over a planar velocity field.
+/// Returns grayscale LIC in `[0,1]` matching section pixel order.
+pub fn line_integral_convolution(n: usize, in_plane: &[[f32; 2]], steps: usize) -> Vec<f32> {
+    assert_eq!(in_plane.len(), n * n);
+    let noise = |row: usize, column: usize| -> f32 {
+        // Deterministic hash noise — no RNG dependency in the section module.
+        let x = (row as u32).wrapping_mul(374761393) ^ (column as u32).wrapping_mul(668265263);
+        let mut z = x.wrapping_add(0x9e37_79b9);
+        z = (z ^ (z >> 16)).wrapping_mul(0x85eb_ca6b);
+        z = (z ^ (z >> 13)).wrapping_mul(0xc2b2_ae35);
+        z = z ^ (z >> 16);
+        (z & 0xffff) as f32 / 65535.0
+    };
+    let sample_uv = |r: f32, c: f32| -> [f32; 2] {
+        let r0 = r.floor().clamp(0.0, (n - 1) as f32) as usize;
+        let c0 = c.floor().clamp(0.0, (n - 1) as f32) as usize;
+        in_plane[r0 * n + c0]
+    };
+    let sample_noise = |r: f32, c: f32| -> f32 {
+        let r0 = r.round().clamp(0.0, (n - 1) as f32) as usize;
+        let c0 = c.round().clamp(0.0, (n - 1) as f32) as usize;
+        noise(r0, c0)
+    };
+    let mut out = vec![0.5f32; n * n];
+    let h = 0.75f32;
+    for row in 0..n {
+        for column in 0..n {
+            let mut acc = 0.0f32;
+            let mut wsum = 0.0f32;
+            for dir in [-1.0f32, 1.0] {
+                let mut r = row as f32;
+                let mut c = column as f32;
+                for step in 0..=steps {
+                    let weight = 1.0 - step as f32 / (steps as f32 + 1.0);
+                    acc += sample_noise(r, c) * weight;
+                    wsum += weight;
+                    let uv = sample_uv(r, c);
+                    let mag = (uv[0] * uv[0] + uv[1] * uv[1]).sqrt().max(1e-4);
+                    c = (c + dir * uv[0] / mag * h).clamp(0.0, (n - 1) as f32);
+                    r = (r + dir * uv[1] / mag * h).clamp(0.0, (n - 1) as f32);
+                }
+            }
+            out[row * n + column] = (acc / wsum).clamp(0.0, 1.0);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -558,9 +625,15 @@ mod tests {
         )
         .unwrap();
         assert!((speed.value(1, 1) - 1.0).abs() < 1e-6);
+        let plane = speed.in_plane.expect("velocity LIC needs in-plane UV");
+        assert_eq!(plane.len(), n * n);
+        // Z section: (uh, uv) = (ux, -uy) = (0.3, -0.4)
+        assert!((plane[n + 1][0] - 0.3).abs() < 1e-6);
+        assert!((plane[n + 1][1] + 0.4).abs() < 1e-6);
         let wake =
             extract_section(&input, SectionAxis::Z, 0.0, SectionQuantity::WakeDeficit).unwrap();
         assert!((wake.value(1, 1) - 0.5).abs() < 1e-6);
+        assert!(wake.in_plane.is_none());
         let traction = extract_section(
             &input,
             SectionAxis::Z,
@@ -627,5 +700,28 @@ mod tests {
         assert_eq!(section.scale.normalize(90.0), -1.0);
         assert_eq!(section.scale.normalize(100.0), 0.0);
         assert_eq!(section.scale.normalize(110.0), 1.0);
+    }
+
+    #[test]
+    fn lic_follows_a_uniform_horizontal_field() {
+        let n = 16;
+        let uv = vec![[1.0, 0.0]; n * n];
+        let lic = line_integral_convolution(n, &uv, 8);
+        assert_eq!(lic.len(), n * n);
+        // Adjacent samples along a streamline should be more correlated than
+        // across streamlines for a horizontal field.
+        let mut along = 0.0f32;
+        let mut across = 0.0f32;
+        for row in 1..n - 1 {
+            for column in 1..n - 1 {
+                let here = lic[row * n + column];
+                along += (here - lic[row * n + column + 1]).abs();
+                across += (here - lic[(row + 1) * n + column]).abs();
+            }
+        }
+        assert!(
+            along < across,
+            "LIC should correlate more along flow ({along}) than across ({across})"
+        );
     }
 }

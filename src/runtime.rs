@@ -14,14 +14,20 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) const RUNTIME_MANIFEST_SCHEMA: &str = "com.reyn.runtime-manifest/1";
 pub(crate) const RUNTIME_STATE_SCHEMA: &str = "com.reyn.runtime-state/1";
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
 pub(crate) const TARGET_PLATFORM: &str = "macos";
 #[cfg(target_os = "windows")]
 pub(crate) const TARGET_PLATFORM: &str = "windows";
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+pub(crate) const TARGET_PLATFORM: &str = "linux";
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+pub(crate) const TARGET_PLATFORM: &str = "unsupported";
+#[cfg(target_os = "macos")]
 pub(crate) const TARGET_ARCHITECTURE: &str = "arm64";
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 pub(crate) const TARGET_ARCHITECTURE: &str = "x86_64";
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+pub(crate) const TARGET_ARCHITECTURE: &str = "unsupported";
 pub(crate) const MINIMUM_MACOS: &str = "14.0";
 pub(crate) const PYTHON_VERSION: &str = "3.14.6";
 pub(crate) const TORCH_VERSION: &str = "2.13.0";
@@ -108,38 +114,31 @@ pub(crate) struct RuntimePlatformSpec {
 }
 
 const MACOS_ARM64_SPEC: RuntimePlatformSpec = RuntimePlatformSpec {
-    platform: if cfg!(target_os = "windows") {
-        "macos"
-    } else {
-        TARGET_PLATFORM
-    },
-    architecture: if cfg!(target_os = "windows") {
-        "arm64"
-    } else {
-        TARGET_ARCHITECTURE
-    },
+    platform: "macos",
+    architecture: "arm64",
     minimum_os: Some(MINIMUM_MACOS),
     python_relative_path: "bin/python3.14",
 };
 
 const WINDOWS_X64_SPEC: RuntimePlatformSpec = RuntimePlatformSpec {
-    platform: if cfg!(target_os = "windows") {
-        TARGET_PLATFORM
-    } else {
-        "windows"
-    },
-    architecture: if cfg!(target_os = "windows") {
-        TARGET_ARCHITECTURE
-    } else {
-        "x86_64"
-    },
+    platform: "windows",
+    architecture: "x86_64",
     minimum_os: None,
     python_relative_path: "python.exe",
+};
+
+const LINUX_X64_SPEC: RuntimePlatformSpec = RuntimePlatformSpec {
+    platform: "linux",
+    architecture: "x86_64",
+    minimum_os: None,
+    python_relative_path: "bin/python3.14",
 };
 
 fn target_platform_spec() -> &'static RuntimePlatformSpec {
     if cfg!(target_os = "windows") {
         &WINDOWS_X64_SPEC
+    } else if cfg!(target_os = "linux") {
+        &LINUX_X64_SPEC
     } else {
         &MACOS_ARM64_SPEC
     }
@@ -407,6 +406,7 @@ fn normalize_platform(platform: &str) -> String {
     match platform.to_ascii_lowercase().as_str() {
         "darwin" | "macos" => "macos".into(),
         "win32" | "win64" | "windows" => "windows".into(),
+        "linux" => "linux".into(),
         other => other.into(),
     }
 }
@@ -483,23 +483,33 @@ pub(crate) fn factory_runtime_root(current_exe: &Path) -> Option<PathBuf> {
 }
 
 fn factory_runtime_root_for(current_exe: &Path, platform: &str) -> Option<PathBuf> {
-    if normalize_platform(platform) == "windows" {
-        return current_exe
+    match normalize_platform(platform).as_str() {
+        "windows" | "linux" => current_exe
             .parent()
-            .map(|directory| directory.join("ReynPython"));
+            .map(|directory| directory.join("ReynPython")),
+        _ => {
+            let macos = current_exe.parent()?;
+            let contents = macos.parent()?;
+            (macos.file_name()?.to_str()? == "MacOS"
+                && contents.file_name()?.to_str()? == "Contents")
+                .then(|| contents.join("Resources/ReynPython"))
+        }
     }
-    let macos = current_exe.parent()?;
-    let contents = macos.parent()?;
-    (macos.file_name()?.to_str()? == "MacOS" && contents.file_name()?.to_str()? == "Contents")
-        .then(|| contents.join("Resources/ReynPython"))
 }
 
 pub(crate) fn default_managed_runtime_root() -> Option<PathBuf> {
     if cfg!(target_os = "windows") {
         std::env::var_os("LOCALAPPDATA").map(|root| PathBuf::from(root).join("Reyn Studio/Runtime"))
-    } else {
+    } else if cfg!(target_os = "macos") {
         std::env::var_os("HOME")
             .map(|home| PathBuf::from(home).join("Library/Application Support/Reyn Studio/Runtime"))
+    } else {
+        std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
+            })
+            .map(|root| root.join("reyn-studio/runtime"))
     }
 }
 
@@ -2498,6 +2508,15 @@ printf 'REYN_RUNTIME_SMOKE {"schema":"com.reyn.runtime-smoke/1","python":"3.14.6
         assert_eq!(
             factory_runtime_root_for(Path::new("/portable/Reyn Studio.exe"), "windows"),
             Some(PathBuf::from("/portable/ReynPython"))
+        );
+        assert_eq!(normalize_platform("linux"), "linux");
+        assert_eq!(
+            factory_runtime_root_for(Path::new("/portable/reyn-studio"), "linux"),
+            Some(PathBuf::from("/portable/ReynPython"))
+        );
+        assert_eq!(
+            python_relative_path(PYTHON_VERSION, "linux").unwrap(),
+            PathBuf::from("bin/python3.14")
         );
         let runtime_id = format!("sha256:{}", "a".repeat(64));
         let slot_name = runtime_slot_name(&runtime_id).unwrap();
