@@ -1162,11 +1162,7 @@ fn occluded_by_solid(field: &ModelVelocityField, eye: [f32; 3], point: [f32; 3])
     if field.mask.is_none() {
         return false;
     }
-    let delta = [
-        point[0] - eye[0],
-        point[1] - eye[1],
-        point[2] - eye[2],
-    ];
+    let delta = [point[0] - eye[0], point[1] - eye[1], point[2] - eye[2]];
     let dist = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2])
         .sqrt()
         .max(1e-4);
@@ -1252,12 +1248,7 @@ fn model_streamline_polys(
 ) -> Vec<(Vec<Pos2>, Vec<f32>)> {
     model_streamline_traces(field, fit_bounds)
         .into_iter()
-        .map(|(trace, speeds)| {
-            (
-                trace.into_iter().map(|p| project(p).0).collect(),
-                speeds,
-            )
-        })
+        .map(|(trace, speeds)| (trace.into_iter().map(|p| project(p).0).collect(), speeds))
         .collect()
 }
 
@@ -1808,12 +1799,11 @@ mod tests {
             3.5 / 7.0 * 2.0 - 1.0,
         ];
         assert!(sample_model_mask(&field, brick_center) >= STREAMLINE_SOLID);
-        assert_eq!(sample_model_velocity(&field, [-0.8, 0.0, 0.0]), [1.0, 0.0, 0.0]);
-        assert!(occluded_by_solid(
-            &field,
-            [-0.9, 0.0, 0.0],
-            [0.9, 0.0, 0.0]
-        ));
+        assert_eq!(
+            sample_model_velocity(&field, [-0.8, 0.0, 0.0]),
+            [1.0, 0.0, 0.0]
+        );
+        assert!(occluded_by_solid(&field, [-0.9, 0.0, 0.0], [0.9, 0.0, 0.0]));
         assert!(!occluded_by_solid(
             &field,
             [-0.9, 0.8, 0.8],
@@ -1826,7 +1816,9 @@ mod tests {
         );
         assert!(!polys.is_empty());
         assert!(
-            polys.iter().any(|(poly, _)| poly.len() >= 2 && poly.len() < 48),
+            polys
+                .iter()
+                .any(|(poly, _)| poly.len() >= 2 && poly.len() < 48),
             "at least the seeds that strike the brick must terminate"
         );
         let brick_face = 3.0 / 7.0 * 2.0 - 1.0;

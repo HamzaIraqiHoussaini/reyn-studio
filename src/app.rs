@@ -442,10 +442,7 @@ fn classify_orientation_result(
     }
 }
 
-fn geometry_setup_engine_status(
-    name: &str,
-    preflight: &engineering::GeometryPreflight,
-) -> String {
+fn geometry_setup_engine_status(name: &str, preflight: &engineering::GeometryPreflight) -> String {
     let geometry = format!(
         "● {name}: {} triangles → {} solid voxels @ {}³",
         preflight.triangles, preflight.solid_voxels, preflight.target_grid
@@ -589,9 +586,10 @@ impl GeometryImportWorker {
                         ) {
                             Ok(imported) => {
                                 let diagnostics = cad::diagnose_mesh(&imported.mesh);
-                                let orientation = cad::BodyOrientation::align_longest_extent_to_stream(
-                                    diagnostics.extents,
-                                );
+                                let orientation =
+                                    cad::BodyOrientation::align_longest_extent_to_stream(
+                                        diagnostics.extents,
+                                    );
                                 match cad::voxelize_oriented(
                                     &imported.mesh,
                                     request.grid,
@@ -2257,23 +2255,21 @@ fn cad_moment_engine_args(
     let origin = match operating.moment_origin_mode {
         engineering::MomentOriginMode::DiffuseSurfaceCentroid => None,
         engineering::MomentOriginMode::SourceFramePoint => {
-            let scale = operating.length_unit.meters_per_unit().ok_or_else(|| {
-                "Moment origin requires confirmed geometry units.".to_string()
-            })?;
+            let scale = operating
+                .length_unit
+                .meters_per_unit()
+                .ok_or_else(|| "Moment origin requires confirmed geometry units.".to_string())?;
             let source_m = operating.moment_origin_source_m().ok_or_else(|| {
                 "Moment origin coordinates are incomplete or non-finite.".to_string()
             })?;
-            let solver =
-                engineering::source_m_to_solver_point(source_m, transform_4x4, scale)?;
+            let solver = engineering::source_m_to_solver_point(source_m, transform_4x4, scale)?;
             Some([solver[0] as f32, solver[1] as f32, solver[2] as f32])
         }
     };
     Ok((
         mode,
         origin,
-        operating
-            .aero_reference_area_m2()
-            .map(|area| area as f32),
+        operating.aero_reference_area_m2().map(|area| area as f32),
     ))
 }
 
@@ -2876,7 +2872,8 @@ impl ReynApp {
                         for k in 0..n {
                             let source = i * n * n + j * n + k;
                             let target = (k * n + j) * n + i;
-                            mask_u8[target] = cad_field_ready::surface_mask_u8_sample(fields.mask[source]);
+                            mask_u8[target] =
+                                cad_field_ready::surface_mask_u8_sample(fields.mask[source]);
                         }
                     }
                 }
@@ -3790,9 +3787,7 @@ impl ReynApp {
         let case_revision_id = match pending.workflow.case_revision_id.clone() {
             Some(revision) => revision,
             None => {
-                self.fail_cad_field_ready_queue(
-                    "active case revision missing".into(),
-                );
+                self.fail_cad_field_ready_queue("active case revision missing".into());
                 return;
             }
         };
@@ -3815,15 +3810,11 @@ impl ReynApp {
             },
         };
         let Some(worker) = self.cad_field_ready_worker.as_ref() else {
-            self.fail_cad_field_ready_queue(
-                "CAD field preparation worker is unavailable.".into(),
-            );
+            self.fail_cad_field_ready_queue("CAD field preparation worker is unavailable.".into());
             return;
         };
         if worker.request_tx.send(request).is_err() {
-            self.fail_cad_field_ready_queue(
-                "CAD field preparation worker stopped.".into(),
-            );
+            self.fail_cad_field_ready_queue("CAD field preparation worker stopped.".into());
             return;
         }
         self.cad_field_ready_pending = Some(PendingCadFieldReady {
@@ -4235,8 +4226,7 @@ impl ReynApp {
                     "Import geometry for external-flow case",
                 )
             });
-            if import.clicked()
-            {
+            if import.clicked() {
                 self.import_cad();
             }
             return;
@@ -4339,7 +4329,11 @@ impl ReynApp {
                     egui::Button::new(label).selected(focus_stage == Some(stage)),
                 );
                 response.widget_info(|| {
-                    egui::WidgetInfo::labeled(egui::WidgetType::Button, response.enabled(), &a11y_name)
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Button,
+                        response.enabled(),
+                        &a11y_name,
+                    )
                 });
                 if response.clicked() {
                     requested_study_stage = Some(stage);
@@ -4527,9 +4521,7 @@ impl ReynApp {
                             .changed();
                     }
                 });
-            length_unit_combo
-                .response
-                .labelled_by(length_unit_label.id);
+            length_unit_combo.response.labelled_by(length_unit_label.id);
             if case.workflow.operating.length_unit != previous_unit
                 && case
                     .workflow
@@ -5211,9 +5203,7 @@ impl ReynApp {
                     ui,
                     "Qualification",
                     &selected.qualification_class,
-                    if selected.qualification_class
-                        == engine::MODEL_QUALIFICATION_PRODUCTION
-                    {
+                    if selected.qualification_class == engine::MODEL_QUALIFICATION_PRODUCTION {
                         SUCCESS
                     } else {
                         WARN
@@ -9441,8 +9431,8 @@ impl ReynApp {
                         "{project_location} · schema v{}",
                         project::PROJECT_SCHEMA_VERSION
                     ))
-                        .text_style(mono_s())
-                        .color(TEXT_MUTE),
+                    .text_style(mono_s())
+                    .color(TEXT_MUTE),
                 );
                 let (project_state, project_state_color) = if self.project.is_recovered() {
                     ("RECOVERED · UNSAVED", WARN)
@@ -18613,9 +18603,10 @@ fn engineering_section_image(section: &engineering_section::SectionPlane) -> egu
             (section.mask_value(neighbor_row, neighbor_column) >= 0.5) != solid
         })
     };
-    let lic = section.in_plane.as_ref().map(|uv| {
-        engineering_section::line_integral_convolution(n, uv, 12)
-    });
+    let lic = section
+        .in_plane
+        .as_ref()
+        .map(|uv| engineering_section::line_integral_convolution(n, uv, 12));
     let mut pixels = Vec::with_capacity(n * n);
     for row in 0..n {
         for column in 0..n {

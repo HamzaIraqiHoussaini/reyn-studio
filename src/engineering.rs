@@ -207,7 +207,10 @@ impl OperatingPoint {
             return None;
         }
         let velocity = target_re * self.viscosity / (self.density * self.reference_length * scale);
-        velocity.is_finite().then_some(velocity).filter(|v| *v > 0.0)
+        velocity
+            .is_finite()
+            .then_some(velocity)
+            .filter(|v| *v > 0.0)
     }
 
     pub fn reynolds_in_qualified_envelope(&self) -> bool {
@@ -2893,10 +2896,9 @@ mod tests {
 
     #[test]
     fn named_region_identity_fields_default_on_legacy_json() {
-        let region: NamedRegionAssignment = serde_json::from_str(
-            r#"{"name":"inlet","candidate_id":"component-0","role":"inlet"}"#,
-        )
-        .unwrap();
+        let region: NamedRegionAssignment =
+            serde_json::from_str(r#"{"name":"inlet","candidate_id":"component-0","role":"inlet"}"#)
+                .unwrap();
         assert!(region.identity_kind.is_empty());
         assert!(region.stable_face_id.is_empty());
         assert_eq!(

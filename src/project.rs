@@ -717,10 +717,12 @@ impl ProjectDocument {
     ) -> ContentInsert {
         let digest = digested.digest().to_owned();
         let deduplicated = self.content.contains_key(&digest);
-        self.content.entry(digest.clone()).or_insert_with(|| BundledContent {
-            media_type: media_type.into(),
-            bytes: digested.into_bytes(),
-        });
+        self.content
+            .entry(digest.clone())
+            .or_insert_with(|| BundledContent {
+                media_type: media_type.into(),
+                bytes: digested.into_bytes(),
+            });
         self.invalid_content
             .retain(|wire| !wire.content_sha256.eq_ignore_ascii_case(&digest));
         self.load_diagnostics.retain(|diagnostic| {

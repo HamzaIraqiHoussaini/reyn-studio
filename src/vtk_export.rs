@@ -909,8 +909,7 @@ mod tests {
     }
 
     fn paraview_smoke_fixture_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("docs/qa/paraview-vtk-smoke/fixture.vtk")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/qa/paraview-vtk-smoke/fixture.vtk")
     }
 
     #[test]

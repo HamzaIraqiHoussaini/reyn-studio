@@ -64,7 +64,10 @@ impl FaceIdentity {
     }
 
     pub fn heuristic_index(index: usize) -> Self {
-        Self::new(FaceIdentityKind::HeuristicIndex, format!("component-{index}"))
+        Self::new(
+            FaceIdentityKind::HeuristicIndex,
+            format!("component-{index}"),
+        )
     }
 
     pub fn is_evidence_safe(&self) -> bool {
@@ -299,8 +302,18 @@ mod tests {
 
     #[test]
     fn heuristic_identities_are_never_preserved() {
-        let previous = [region("inlet", "inlet", FaceIdentityKind::HeuristicIndex, "component-0")];
-        let next = [region("inlet", "inlet", FaceIdentityKind::HeuristicIndex, "component-0")];
+        let previous = [region(
+            "inlet",
+            "inlet",
+            FaceIdentityKind::HeuristicIndex,
+            "component-0",
+        )];
+        let next = [region(
+            "inlet",
+            "inlet",
+            FaceIdentityKind::HeuristicIndex,
+            "component-0",
+        )];
         let report = diff_named_region_identities(&previous, &next);
         assert!(report.has_ambiguous());
         assert!(validate_region_remap_for_evidence(&report)
@@ -310,8 +323,18 @@ mod tests {
 
     #[test]
     fn bridge_face_ids_preserve_across_reimport() {
-        let previous = [region("wall", "wall", FaceIdentityKind::BridgeFaceId, "face:17")];
-        let next = [region("wall", "wall", FaceIdentityKind::BridgeFaceId, "face:17")];
+        let previous = [region(
+            "wall",
+            "wall",
+            FaceIdentityKind::BridgeFaceId,
+            "face:17",
+        )];
+        let next = [region(
+            "wall",
+            "wall",
+            FaceIdentityKind::BridgeFaceId,
+            "face:17",
+        )];
         let report = diff_named_region_identities(&previous, &next);
         assert_eq!(report.entries.len(), 1);
         assert_eq!(report.entries[0].class, RemapClass::Preserved);

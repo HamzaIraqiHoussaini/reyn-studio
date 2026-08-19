@@ -530,7 +530,6 @@ mod tests {
         .expect("STEP cuboid should support orientation re-voxelization");
     }
 
-
     #[test]
     fn cuboid_minimum_cells_across_at_64() {
         let bytes = include_bytes!("../test-geometry/cuboid_ap214.step");
@@ -538,8 +537,8 @@ mod tests {
         let diagnostics = crate::cad::diagnose_mesh(&imported.mesh);
         let orientation =
             crate::cad::BodyOrientation::align_longest_extent_to_stream(diagnostics.extents);
-        let vm = crate::cad::voxelize_oriented(&imported.mesh, 64, orientation)
-            .expect("voxelize 64");
+        let vm =
+            crate::cad::voxelize_oriented(&imported.mesh, 64, orientation).expect("voxelize 64");
         eprintln!(
             "cuboid64 solid={} min_cells={} clearance={} orientation={:?} disagreement={:.4}",
             vm.solid_voxels,

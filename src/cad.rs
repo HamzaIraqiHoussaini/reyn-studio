@@ -551,11 +551,7 @@ impl BodyOrientation {
             }
         }
         // Near-cube: leave the imported attitude alone.
-        let shortest = extents
-            .iter()
-            .copied()
-            .fold(f32::MAX, f32::min)
-            .max(1e-12);
+        let shortest = extents.iter().copied().fold(f32::MAX, f32::min).max(1e-12);
         if extents[longest] / shortest < 1.05 {
             return Self::default();
         }

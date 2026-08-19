@@ -258,7 +258,10 @@ mod tests {
             Some(ready.field.digest())
         );
         assert_eq!(ready.surface_mask_u8.len(), 8 * 8 * 8);
-        assert_eq!(ready.engineering_result.moment_origin_mode, "diffuse_surface_centroid");
+        assert_eq!(
+            ready.engineering_result.moment_origin_mode,
+            "diffuse_surface_centroid"
+        );
     }
 
     #[test]
