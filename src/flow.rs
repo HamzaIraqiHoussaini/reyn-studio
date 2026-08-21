@@ -137,6 +137,11 @@ pub fn from_field(shape: &[usize], data: &[f32]) -> Vec<Particle> {
 /// normalized to `[0,1]` and laid out for a wgpu 3D texture (x = i fastest,
 /// then j, then k). Feeds the volume raymarch. Returns `(bytes, [nx,ny,nz])`.
 pub fn vorticity_volume(shape: &[usize], data: &[f32]) -> Option<(Vec<u8>, [u32; 3])> {
+    vorticity_field(shape, data).map(|volume| (volume.bytes, volume.dims))
+}
+
+/// Normalized |ω| volume plus the physical peak used for an honest colorbar.
+pub fn vorticity_field(shape: &[usize], data: &[f32]) -> Option<NormalizedVolume> {
     if shape.len() != 4 || shape[0] != 3 {
         return None;
     }
@@ -148,6 +153,8 @@ pub fn vorticity_volume(shape: &[usize], data: &[f32]) -> Option<(Vec<u8>, [u32;
     let cl = |v: i64, n: usize| v.clamp(0, n as i64 - 1) as usize;
     let mut mag = vec![0f32; nx * ny * nz];
     let mut maxv = 1e-6f32;
+    let mut sum = 0.0f32;
+    let mut count = 0usize;
     for i in 0..nx {
         let (ip, im) = (cl(i as i64 + 1, nx), cl(i as i64 - 1, nx));
         for j in 0..ny {
@@ -162,6 +169,10 @@ pub fn vorticity_volume(shape: &[usize], data: &[f32]) -> Option<(Vec<u8>, [u32;
                 if m > maxv {
                     maxv = m;
                 }
+                if m > 0.0 {
+                    sum += m;
+                    count += 1;
+                }
             }
         }
     }
@@ -169,13 +180,74 @@ pub fn vorticity_volume(shape: &[usize], data: &[f32]) -> Option<(Vec<u8>, [u32;
         .iter()
         .map(|m| ((m / maxv).clamp(0.0, 1.0) * 255.0) as u8)
         .collect();
-    Some((bytes, [nx as u32, ny as u32, nz as u32]))
+    Some(NormalizedVolume {
+        bytes,
+        dims: [nx as u32, ny as u32, nz as u32],
+        physical_max: maxv,
+        mean_positive: if count == 0 { 0.0 } else { sum / count as f32 },
+    })
+}
+
+/// Normalized scalar volume plus the physical peak used for an honest colorbar.
+#[derive(Clone, Debug)]
+pub struct NormalizedVolume {
+    pub bytes: Vec<u8>,
+    pub dims: [u32; 3],
+    pub physical_max: f32,
+    pub mean_positive: f32,
+}
+
+/// Speed magnitude volume from an engine velocity field `[3,N,N,N]`.
+pub fn speed_volume(shape: &[usize], data: &[f32]) -> Option<NormalizedVolume> {
+    if shape.len() != 4 || shape[0] != 3 {
+        return None;
+    }
+    let (nx, ny, nz) = (shape[1], shape[2], shape[3]);
+    if nx < 2 || ny < 2 || nz < 2 || data.len() < 3 * nx * ny * nz {
+        return None;
+    }
+    let at = |c: usize, i: usize, j: usize, k: usize| data[((c * nx + i) * ny + j) * nz + k];
+    let mut mag = vec![0f32; nx * ny * nz];
+    let mut maxv = 1e-6f32;
+    let mut sum = 0.0f32;
+    let mut count = 0usize;
+    for i in 0..nx {
+        for j in 0..ny {
+            for k in 0..nz {
+                let (u, v, w) = (at(0, i, j, k), at(1, i, j, k), at(2, i, j, k));
+                let m = (u * u + v * v + w * w).sqrt();
+                mag[(k * ny + j) * nx + i] = m;
+                if m > maxv {
+                    maxv = m;
+                }
+                if m > 0.0 {
+                    sum += m;
+                    count += 1;
+                }
+            }
+        }
+    }
+    let bytes = mag
+        .iter()
+        .map(|m| ((m / maxv).clamp(0.0, 1.0) * 255.0) as u8)
+        .collect();
+    Some(NormalizedVolume {
+        bytes,
+        dims: [nx as u32, ny as u32, nz as u32],
+        physical_max: maxv,
+        mean_positive: if count == 0 { 0.0 } else { sum / count as f32 },
+    })
 }
 
 /// Q-criterion scalar volume from an engine velocity field `[3,N,N,N]`.
 /// Stores `max(Q, 0)` normalized to `[0,1]` for a thin iso-surface TF window.
 /// Q = ½(‖Ω‖² − ‖S‖²); positive values mark rotation-dominated vortex cores.
 pub fn q_criterion_volume(shape: &[usize], data: &[f32]) -> Option<(Vec<u8>, [u32; 3])> {
+    q_criterion_field(shape, data).map(|volume| (volume.bytes, volume.dims))
+}
+
+/// Full-field Q (positive part) with the physical peak for a labeled iso value.
+pub fn q_criterion_field(shape: &[usize], data: &[f32]) -> Option<NormalizedVolume> {
     if shape.len() != 4 || shape[0] != 3 {
         return None;
     }
@@ -187,6 +259,8 @@ pub fn q_criterion_volume(shape: &[usize], data: &[f32]) -> Option<(Vec<u8>, [u3
     let cl = |v: i64, n: usize| v.clamp(0, n as i64 - 1) as usize;
     let mut q_field = vec![0f32; nx * ny * nz];
     let mut maxq = 1e-6f32;
+    let mut sum = 0.0f32;
+    let mut count = 0usize;
     for i in 0..nx {
         let (ip, im) = (cl(i as i64 + 1, nx), cl(i as i64 - 1, nx));
         for j in 0..ny {
@@ -213,6 +287,10 @@ pub fn q_criterion_volume(shape: &[usize], data: &[f32]) -> Option<(Vec<u8>, [u3
                 if q > maxq {
                     maxq = q;
                 }
+                if q > 0.0 {
+                    sum += q;
+                    count += 1;
+                }
             }
         }
     }
@@ -220,7 +298,12 @@ pub fn q_criterion_volume(shape: &[usize], data: &[f32]) -> Option<(Vec<u8>, [u3
         .iter()
         .map(|q| ((q / maxq).clamp(0.0, 1.0) * 255.0) as u8)
         .collect();
-    Some((bytes, [nx as u32, ny as u32, nz as u32]))
+    Some(NormalizedVolume {
+        bytes,
+        dims: [nx as u32, ny as u32, nz as u32],
+        physical_max: maxq,
+        mean_positive: if count == 0 { 0.0 } else { sum / count as f32 },
+    })
 }
 
 /// The 3D counterparts of the 2D Field Insights, found in one gradient pass over

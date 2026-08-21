@@ -1,6 +1,6 @@
 {
   "python": "3.14.6",
-  "research_revision": "3515cde4d0f5678437ad6ee6116774f1cd6a3c16",
+  "research_revision": "2339de95e2f60ecb04187a68a7257f9713bd65e6",
   "rust_toolchain": "1.97.0",
   "source_date_epoch": 315532800,
   "target": "x86_64-unknown-linux-gnu"

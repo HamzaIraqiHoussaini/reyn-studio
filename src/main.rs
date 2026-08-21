@@ -9,6 +9,7 @@ mod benchmark_export;
 mod cad;
 mod cad_3mf;
 mod cad_field_ready;
+mod cad_postpro;
 mod cad_step;
 mod credential_store;
 mod engine;

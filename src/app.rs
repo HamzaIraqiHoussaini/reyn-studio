@@ -9,9 +9,9 @@ use crate::menubar::{MenuBar, MenuCommand, MenuSignal, MenuSyncState};
 use crate::signing::LocalSigningKeyStore;
 use crate::theme::*;
 use crate::{
-    cad, cad_field_ready, engine, engineering, engineering_export, engineering_section, flow, gpu,
-    library, painter, project, project_lifecycle, report, settings, signing, units, viewport,
-    vtk_export,
+    cad, cad_field_ready, cad_postpro, engine, engineering, engineering_export,
+    engineering_section, flow, gpu, library, painter, project, project_lifecycle, report, settings,
+    signing, units, viewport, vtk_export,
 };
 use egui::{
     Align, Align2, Color32, CornerRadius, FontId, Frame, Layout, Margin, Rect, RichText, Sense,
@@ -1145,12 +1145,33 @@ pub struct ReynApp {
     render_volume: bool,
     /// Thin Q-criterion iso via the volume raymarch when wake volume is off.
     q_iso_on: bool,
+    /// Iso scalar for the optional contour; Q by default.
+    iso_scalar: cad_postpro::IsoScalar,
+    /// Fraction of the stored field max, shown as a physical iso value.
+    iso_fraction: f32,
+    glyphs_on: bool,
+    glyphs: Vec<cad_postpro::Glyph>,
     volume_data: std::sync::Arc<Vec<u8>>,
     volume_dims: [u32; 3],
     volume_version: u64,
     /// Positive-Q scalar volume for the optional thin iso layer.
     q_volume_data: std::sync::Arc<Vec<u8>>,
     q_volume_dims: [u32; 3],
+    speed_volume_data: std::sync::Arc<Vec<u8>>,
+    speed_volume_dims: [u32; 3],
+    q_max: f32,
+    q_mean_pos: f32,
+    speed_max: f32,
+    vort_max: f32,
+    section_overlay_on: bool,
+    section_b_on: bool,
+    section_b_axis: engineering_section::SectionAxis,
+    section_b_pos: f32,
+    section_b_tex: Option<egui::TextureHandle>,
+    section_b_data: Option<engineering_section::SectionPlane>,
+    section_b_sig: u64,
+    probe_axis: engineering_section::SectionAxis,
+    probe_quantity: cad_postpro::ProbeQuantity,
     // N3 — 2D pressure-recovery view
     f2d: Option<engine::Field2D>,
     f2d_var: FieldVar,
@@ -1345,11 +1366,30 @@ impl Default for ReynApp {
             gpu_ready: false,
             render_volume: false,
             q_iso_on: false,
+            iso_scalar: cad_postpro::IsoScalar::Q,
+            iso_fraction: 0.85,
+            glyphs_on: false,
+            glyphs: Vec::new(),
             volume_data: std::sync::Arc::new(vol),
             volume_dims: vdims,
             volume_version: 1,
             q_volume_data: std::sync::Arc::new(Vec::new()),
             q_volume_dims: [1, 1, 1],
+            speed_volume_data: std::sync::Arc::new(Vec::new()),
+            speed_volume_dims: [1, 1, 1],
+            q_max: 0.0,
+            q_mean_pos: 0.0,
+            speed_max: 0.0,
+            vort_max: 0.0,
+            section_overlay_on: true,
+            section_b_on: true,
+            section_b_axis: engineering_section::SectionAxis::Z,
+            section_b_pos: 0.5,
+            section_b_tex: None,
+            section_b_data: None,
+            section_b_sig: 0,
+            probe_axis: engineering_section::SectionAxis::X,
+            probe_quantity: cad_postpro::ProbeQuantity::PhysicalCp,
             f2d: None,
             f2d_var: FieldVar::Vorticity,
             f2d_horizon: 8,
@@ -2301,6 +2341,9 @@ impl ReynApp {
         self.section_data = None;
         self.section_sig = u64::MAX;
         self.section_error = None;
+        self.section_b_tex = None;
+        self.section_b_data = None;
+        self.section_b_sig = u64::MAX;
     }
 
     /// Drop only the colormapped texture caches (underlying data stays) so an
@@ -2829,21 +2872,23 @@ impl ReynApp {
     fn refresh_display_layers(&mut self) {
         let Some((
             particles,
-            volume,
             insights,
             new_mask_bytes,
             reused_mask,
             displayed_mask_source,
             cp_bytes,
             n,
+            velocity,
+            mask,
         )) = self.cad.as_ref().and_then(|case| {
             let fields = case.display_fields()?;
             let shape = [3usize, fields.n, fields.n, fields.n];
             let particles = flow::from_field(&shape, fields.velocity);
-            let volume = flow::vorticity_volume(&shape, fields.velocity);
             let mut insights = flow::insights3d(&shape, fields.velocity);
             insights.extend(cad::surface_insights(fields.mask, fields.cp, fields.n));
             let n = fields.n;
+            let velocity = fields.velocity.to_vec();
+            let mask = fields.mask.to_vec();
             let displayed_mask_source = if fields.recorded {
                 case.mask.clone()
             } else {
@@ -2890,13 +2935,14 @@ impl ReynApp {
             }
             Some((
                 particles,
-                volume,
                 insights,
                 mask_u8,
                 reused_mask,
                 displayed_mask_source,
                 cp_u8,
                 n,
+                velocity,
+                mask,
             ))
         })
         else {
@@ -2905,11 +2951,7 @@ impl ReynApp {
         if !particles.is_empty() {
             self.particles = particles;
         }
-        if let Some((data, dims)) = volume {
-            self.volume_data = std::sync::Arc::new(data);
-            self.volume_dims = dims;
-            self.volume_version = self.volume_version.wrapping_add(1);
-        }
+        self.refresh_cad_postpro_volumes(n, &velocity, &mask);
         self.insights3d = insights;
         self.cad_version = self.cad_version.wrapping_add(1);
         let (mask, mask_version) = match reused_mask {
@@ -3901,20 +3943,15 @@ impl ReynApp {
         if !ready.particles.is_empty() {
             self.particles = ready.particles;
         }
-        if let Some((vol, dims)) = ready.volume_data {
-            let (lo, hi) = calibrate_cad_volume_density(&vol);
-            // Keep wake filaments subordinate to the Cp shell.
+        self.refresh_cad_postpro_volumes(ready.n, &ready.velocity, &ready.mask);
+        if let Some((vol, _)) = ready.volume_data.as_ref() {
+            let (lo, hi) = calibrate_cad_volume_density(vol);
             self.density_lo = lo.clamp(0.28, 0.55);
             self.density_hi = hi.clamp(self.density_lo + 0.15, 0.92);
-            self.volume_data = std::sync::Arc::new(vol);
-            self.volume_dims = dims;
-            self.volume_version = self.volume_version.wrapping_add(1);
-        }
-        let shape = [3usize, ready.n, ready.n, ready.n];
-        if let Some((q_vol, q_dims)) = flow::q_criterion_volume(&shape, &ready.velocity) {
-            self.q_volume_data = std::sync::Arc::new(q_vol);
-            self.q_volume_dims = q_dims;
-            self.volume_version = self.volume_version.wrapping_add(1);
+        } else if !self.volume_data.is_empty() {
+            let (lo, hi) = calibrate_cad_volume_density(&self.volume_data);
+            self.density_lo = lo.clamp(0.28, 0.55);
+            self.density_hi = hi.clamp(self.density_lo + 0.15, 0.92);
         }
         self.insights3d = ready.insights;
         self.cad_version = self.cad_version.wrapping_add(1);
@@ -3955,6 +3992,13 @@ impl ReynApp {
         self.surface_on = true;
         self.streamlines = true;
         self.q_iso_on = false;
+        self.iso_fraction = 0.85;
+        self.iso_scalar = cad_postpro::IsoScalar::Q;
+        self.glyphs_on = false;
+        self.section_overlay_on = true;
+        self.section_b_on = true;
+        self.section_b_axis = engineering_section::SectionAxis::Z;
+        self.section_b_pos = 0.5;
         self.volumetric = true;
         self.render_volume = false;
         // Default Case/sandbox state enables an X mid-plane clip. A fitted body
@@ -3982,6 +4026,30 @@ impl ReynApp {
             "Immutable run recorded. Body surface and model streamlines are on; Q iso is available under Layers."
         };
         self.project_notice = Some((notice.into(), false));
+    }
+
+    fn refresh_cad_postpro_volumes(&mut self, n: usize, velocity: &[f32], mask: &[f32]) {
+        let shape = [3usize, n, n, n];
+        if let Some(volume) = flow::vorticity_field(&shape, velocity) {
+            self.volume_data = std::sync::Arc::new(volume.bytes);
+            self.volume_dims = volume.dims;
+            self.vort_max = volume.physical_max;
+            self.volume_version = self.volume_version.wrapping_add(1);
+        }
+        if let Some(volume) = flow::q_criterion_field(&shape, velocity) {
+            self.q_volume_data = std::sync::Arc::new(volume.bytes);
+            self.q_volume_dims = volume.dims;
+            self.q_max = volume.physical_max;
+            self.q_mean_pos = volume.mean_positive;
+            self.volume_version = self.volume_version.wrapping_add(1);
+        }
+        if let Some(volume) = flow::speed_volume(&shape, velocity) {
+            self.speed_volume_data = std::sync::Arc::new(volume.bytes);
+            self.speed_volume_dims = volume.dims;
+            self.speed_max = volume.physical_max;
+            self.volume_version = self.volume_version.wrapping_add(1);
+        }
+        self.glyphs = cad_postpro::velocity_glyphs(n, velocity, mask);
     }
 
     fn persist_prepared_external_flow_run(
@@ -6230,8 +6298,17 @@ impl ReynApp {
                 "DERIVED",
                 TEXT_DIM,
             );
-            // Divergence RMS stays in immutable evidence JSON for developer
-            // forensics; it is not a customer Results instrument.
+            measure_row(
+                ui,
+                "Continuity check · ∇·u RMS",
+                &fmt(result.divergence_rms),
+                "–",
+                "MODEL",
+                GOLD,
+            )
+            .on_hover_text(
+                "RMS of discrete divergence on the stored model velocity. This is a continuity check on a one-jump field, not a solver residual history.",
+            );
         });
         ui.add_space(8.0);
         // Reference values the coefficients were scaled with — visible next
@@ -6464,13 +6541,121 @@ impl ReynApp {
                 ui.checkbox(&mut self.surface_on, "Cp surface");
                 ui.checkbox(&mut self.streamlines, "Model streamlines")
                     .on_hover_text(viewport::MODEL_STREAMLINE_LABEL);
-                ui.checkbox(&mut self.q_iso_on, "Q iso-surface")
+                ui.checkbox(&mut self.glyphs_on, "Velocity glyphs")
                     .on_hover_text(
-                        "Thin Q-criterion cores when vorticity volume is off. Disabled while the full wake volume is on.",
+                        "Every 2nd fluid cell on the 32³ lattice. Solids at occupancy ≥ 0.2 are skipped. Recovered from model velocity.",
                     );
+                ui.checkbox(&mut self.q_iso_on, "Iso-contour")
+                    .on_hover_text(
+                        "Thin iso of Q or |U| recovered from model velocity. Off by default so the Cp shell stays readable.",
+                    );
+                if self.q_iso_on {
+                    egui::ComboBox::from_id_salt("results_iso_scalar")
+                        .width(ui.available_width())
+                        .selected_text(self.iso_scalar.label())
+                        .show_ui(ui, |ui| {
+                            for scalar in cad_postpro::IsoScalar::ALL {
+                                ui.selectable_value(&mut self.iso_scalar, scalar, scalar.label());
+                            }
+                        });
+                    ui.add(
+                        egui::Slider::new(&mut self.iso_fraction, 0.0..=1.0)
+                            .text("iso / max")
+                            .show_value(true)
+                            .trailing_fill(true),
+                    );
+                    let field_max = match self.iso_scalar {
+                        cad_postpro::IsoScalar::Q => self.q_max,
+                        cad_postpro::IsoScalar::Speed => self.speed_max,
+                    };
+                    ui.label(
+                        RichText::new(format!(
+                            "iso = {:.4} {} · max {:.4} · {}",
+                            cad_postpro::physical_iso_value(self.iso_fraction, field_max),
+                            self.iso_scalar.units(),
+                            field_max,
+                            self.iso_scalar.source()
+                        ))
+                        .text_style(caption())
+                        .color(TEXT_MUTE),
+                    );
+                }
                 ui.checkbox(&mut self.render_volume, "Vorticity volume")
-                    .on_hover_text("Optional full-domain |ω| fog — off by default");
+                    .on_hover_text(
+                        "Optional full-domain |ω| recovered from model velocity — off by default",
+                    );
                 ui.checkbox(&mut self.insights_on, "Load and suction hotspots");
+            });
+            inspector_group(ui, "results-cut", "Cutting planes", true, |ui| {
+                ui.checkbox(&mut self.section_overlay_on, "Plane A inset");
+                ui.label(
+                    RichText::new("Offset after Run — not buried behind 2D section.")
+                        .text_style(caption())
+                        .color(TEXT_MUTE),
+                );
+                egui::ComboBox::from_id_salt("results_cut_a")
+                    .selected_text(self.section_axis.label())
+                    .show_ui(ui, |ui| {
+                        for axis in engineering_section::SectionAxis::ALL {
+                            ui.selectable_value(&mut self.section_axis, axis, axis.label());
+                        }
+                    });
+                let axis_a = self.section_axis.id() as usize;
+                ui.add(
+                    egui::Slider::new(&mut self.slice_pos[axis_a], 0.0..=1.0)
+                        .text("A offset")
+                        .show_value(true)
+                        .trailing_fill(true),
+                );
+                ui.checkbox(&mut self.section_b_on, "Plane B inset");
+                egui::ComboBox::from_id_salt("results_cut_b")
+                    .selected_text(self.section_b_axis.label())
+                    .show_ui(ui, |ui| {
+                        for axis in engineering_section::SectionAxis::ALL {
+                            ui.selectable_value(&mut self.section_b_axis, axis, axis.label());
+                        }
+                    });
+                ui.add(
+                    egui::Slider::new(&mut self.section_b_pos, 0.0..=1.0)
+                        .text("B offset")
+                        .show_value(true)
+                        .trailing_fill(true),
+                );
+            });
+            inspector_group(ui, "results-probe", "Line probe", true, |ui| {
+                ui.label(
+                    RichText::new("One curve on this field — not a time history.")
+                        .text_style(caption())
+                        .color(TEXT_MUTE),
+                );
+                ui.horizontal(|ui| {
+                    for axis in engineering_section::SectionAxis::ALL {
+                        if seg(ui, axis.label(), self.probe_axis == axis) {
+                            self.probe_axis = axis;
+                        }
+                    }
+                });
+                egui::ComboBox::from_id_salt("results_probe_qty")
+                    .width(ui.available_width())
+                    .selected_text(self.probe_quantity.label())
+                    .show_ui(ui, |ui| {
+                        for quantity in cad_postpro::ProbeQuantity::ALL {
+                            ui.selectable_value(
+                                &mut self.probe_quantity,
+                                quantity,
+                                format!("{} · {}", quantity.label(), quantity.units()),
+                            );
+                        }
+                    });
+                if let Some(probe) = self.current_line_probe() {
+                    draw_line_probe_plot(ui, &probe);
+                } else {
+                    ui.label(
+                        RichText::new("No stored field to sample.")
+                            .text_style(caption())
+                            .color(TEXT_MUTE),
+                    );
+                }
             });
         } else {
             ui.label(caps("2D section quantity"));
@@ -6575,10 +6760,23 @@ impl ReynApp {
         inspector_group(ui, "results-voxel", "Voxel diagnostics", false, |ui| {
             ui.label(chip_text("MODEL · rendered velocity field").color(BRAND));
             ui.add_space(8.0);
-            let (helicity, enstrophy, q_criterion, voxel_count) = diagnostics(&self.particles);
+            let (helicity, enstrophy, _particle_q, voxel_count) = diagnostics(&self.particles);
             diag(ui, "Helicity", &format!("{:.1e}", helicity), BRAND);
             diag(ui, "Enstrophy Vol.", &format!("{:.2e}", enstrophy), BRAND);
-            diag(ui, "Q-Criterion", &format!("{:.2}", q_criterion), GOLD);
+            diag(ui, "Q max (field)", &format!("{:.3e}", self.q_max), GOLD);
+            ui.label(
+                RichText::new(
+                    "Full-field Q = ½(‖Ω‖² − ‖S‖²) from model velocity. Not the particle-subsample heuristic.",
+                )
+                .text_style(caption())
+                .color(TEXT_MUTE),
+            );
+            diag(
+                ui,
+                "Mean Q⁺ (field)",
+                &format!("{:.3e}", self.q_mean_pos),
+                GOLD,
+            );
             diag(
                 ui,
                 "Voxel Count",
@@ -11530,6 +11728,14 @@ impl ReynApp {
         self.volume_version = self.volume_version.wrapping_add(1);
         self.q_volume_data = std::sync::Arc::new(Vec::new());
         self.q_volume_dims = [1, 1, 1];
+        self.speed_volume_data = std::sync::Arc::new(Vec::new());
+        self.speed_volume_dims = [1, 1, 1];
+        self.glyphs.clear();
+        self.glyphs_on = false;
+        self.q_max = 0.0;
+        self.q_mean_pos = 0.0;
+        self.speed_max = 0.0;
+        self.vort_max = 0.0;
         self.render_volume = false;
         self.q_iso_on = false;
         self.streamlines = false;
@@ -12330,16 +12536,7 @@ impl ReynApp {
         };
         let shape = [3usize, field.n, field.n, field.n];
         self.particles = flow::from_field(&shape, &field.velocity);
-        if let Some((volume, dims)) = flow::vorticity_volume(&shape, &field.velocity) {
-            self.volume_data = std::sync::Arc::new(volume);
-            self.volume_dims = dims;
-            self.volume_version = self.volume_version.wrapping_add(1);
-        }
-        if let Some((q_vol, q_dims)) = flow::q_criterion_volume(&shape, &field.velocity) {
-            self.q_volume_data = std::sync::Arc::new(q_vol);
-            self.q_volume_dims = q_dims;
-            self.volume_version = self.volume_version.wrapping_add(1);
-        }
+        self.refresh_cad_postpro_volumes(field.n, &field.velocity, &field.mask);
         let mut insights = flow::insights3d(&shape, &field.velocity);
         insights.extend(cad::surface_insights(&field.mask, &field.cp, field.n));
         self.insights3d = insights;
@@ -12450,6 +12647,10 @@ impl ReynApp {
         self.surface_on = true;
         self.streamlines = true;
         self.q_iso_on = false;
+        self.iso_fraction = 0.85;
+        self.glyphs_on = false;
+        self.section_overlay_on = true;
+        self.section_b_on = true;
         self.volumetric = true;
         self.render_volume = false;
         self.slice = [false, false, false];
@@ -12841,18 +13042,11 @@ impl ReynApp {
             if !particles.is_empty() {
                 self.particles = particles;
             }
-            if let Some((volume, dimensions)) = flow::vorticity_volume(&shape, velocity) {
-                let (lo, hi) = calibrate_cad_volume_density(&volume);
+            self.refresh_cad_postpro_volumes(result_grid, velocity, &mask);
+            if !self.volume_data.is_empty() {
+                let (lo, hi) = calibrate_cad_volume_density(&self.volume_data);
                 self.density_lo = lo;
                 self.density_hi = hi;
-                self.volume_data = std::sync::Arc::new(volume);
-                self.volume_dims = dimensions;
-                self.volume_version = self.volume_version.wrapping_add(1);
-            }
-            if let Some((q_vol, q_dims)) = flow::q_criterion_volume(&shape, velocity) {
-                self.q_volume_data = std::sync::Arc::new(q_vol);
-                self.q_volume_dims = q_dims;
-                self.volume_version = self.volume_version.wrapping_add(1);
             }
             let mut insights = flow::insights3d(&shape, velocity);
             insights.extend(cad::surface_insights(&mask, &cp, result_grid));
@@ -12860,6 +13054,10 @@ impl ReynApp {
             self.surface_on = true;
             self.streamlines = true;
             self.q_iso_on = false;
+            self.iso_fraction = 0.85;
+            self.glyphs_on = false;
+            self.section_overlay_on = true;
+            self.section_b_on = true;
             self.render_volume = false;
             self.slice = [false, false, false];
             self.view_fit = true;
@@ -14457,9 +14655,15 @@ impl ReynApp {
                             && self.cad.as_ref().is_some_and(|c| c.surf.is_some());
                         let q_live = self.q_iso_on
                             && !self.render_volume
-                            && !self.q_volume_data.is_empty();
+                            && match self.iso_scalar {
+                                cad_postpro::IsoScalar::Q => !self.q_volume_data.is_empty(),
+                                cad_postpro::IsoScalar::Speed => {
+                                    !self.speed_volume_data.is_empty()
+                                }
+                            };
                         let volume_mode = self.volumetric
                             && (self.render_volume || surface_live || q_live);
+                        let iso_window = cad_postpro::iso_density_window(self.iso_fraction);
                         let (vol_data, vol_dims, dens_lo, dens_hi) = if self.render_volume {
                             (
                                 self.volume_data.clone(),
@@ -14468,13 +14672,20 @@ impl ReynApp {
                                 self.density_hi,
                             )
                         } else if q_live {
-                            // Tight TF window → thin vortex cores, not a fog blob.
-                            (
-                                self.q_volume_data.clone(),
-                                self.q_volume_dims,
-                                0.78,
-                                0.99,
-                            )
+                            match self.iso_scalar {
+                                cad_postpro::IsoScalar::Q => (
+                                    self.q_volume_data.clone(),
+                                    self.q_volume_dims,
+                                    iso_window.0,
+                                    iso_window.1,
+                                ),
+                                cad_postpro::IsoScalar::Speed => (
+                                    self.speed_volume_data.clone(),
+                                    self.speed_volume_dims,
+                                    iso_window.0,
+                                    iso_window.1,
+                                ),
+                            }
                         } else {
                             // Surface-only: density gate never opens, raymarch
                             // still shades the Cp body from the surface textures.
@@ -14559,11 +14770,19 @@ impl ReynApp {
                             } else {
                                 None
                             },
+                            glyphs: if self.nav == Nav::Results && self.glyphs_on {
+                                self.glyphs.clone()
+                            } else {
+                                Vec::new()
+                            },
                         };
                         let interaction =
                             viewport::show(ui, rect, &mut self.cam, &opts, &self.particles);
                         if let Some(screen) = interaction.picked {
                             self.probe_surface_at(rect, screen);
+                        }
+                        if self.nav == Nav::Results {
+                            self.paint_results_instruments(ui, rect);
                         }
                     }
                 }
@@ -15371,6 +15590,168 @@ impl ReynApp {
 
     /// Geometry-linked 2D evidence from the active immutable engineering field.
     /// No standalone/sandbox Field2D state participates in this path.
+    fn current_line_probe(&self) -> Option<cad_postpro::LineProbe> {
+        let case = self.cad.as_ref()?;
+        let fields = case.display_fields()?;
+        Some(cad_postpro::sample_line_probe(
+            fields.n,
+            self.probe_axis,
+            self.probe_quantity,
+            fields.velocity,
+            fields.cp,
+            fields.mask,
+        ))
+    }
+
+    fn paint_results_instruments(&mut self, ui: &mut egui::Ui, rect: Rect) {
+        if self.section_overlay_on || self.section_b_on {
+            self.ensure_cad_section_texture(ui.ctx());
+            self.ensure_cad_section_b_texture(ui.ctx());
+        }
+        let painter = ui.painter_at(rect);
+        let (label, units, min, max, signed, source) = if self.render_volume {
+            (
+                "|ω|",
+                "nondim",
+                0.0,
+                self.vort_max,
+                false,
+                "recovered from model velocity",
+            )
+        } else if self.q_iso_on {
+            match self.iso_scalar {
+                cad_postpro::IsoScalar::Q => (
+                    "Q",
+                    self.iso_scalar.units(),
+                    0.0,
+                    self.q_max,
+                    false,
+                    self.iso_scalar.source(),
+                ),
+                cad_postpro::IsoScalar::Speed => (
+                    "|U|",
+                    self.iso_scalar.units(),
+                    0.0,
+                    self.speed_max,
+                    false,
+                    self.iso_scalar.source(),
+                ),
+            }
+        } else if self.glyphs_on {
+            (
+                "|U| glyphs",
+                "nondim",
+                0.0,
+                self.speed_max,
+                false,
+                "recovered from model velocity",
+            )
+        } else if let Some(case) = self.cad.as_ref() {
+            let (min, max) = case
+                .display_fields()
+                .map(|fields| cad_postpro::signed_cp_range(fields.cp))
+                .or_else(|| {
+                    case.workflow
+                        .result
+                        .as_ref()
+                        .map(|result| (result.cp_min as f32, result.cp_max as f32))
+                })
+                .unwrap_or((0.0, 1.0));
+            ("Cp", "1", min, max, true, "derived from recovered pressure")
+        } else {
+            ("Cp", "1", 0.0, 1.0, true, "derived from recovered pressure")
+        };
+        draw_physical_colorbar(&painter, rect, label, units, min, max, signed, source);
+
+        let mut inset_y = rect.max.y - 16.0;
+        if self.section_overlay_on {
+            if let (Some(texture), Some(section)) =
+                (self.section_tex.as_ref(), self.section_data.as_ref())
+            {
+                inset_y = draw_section_inset(&painter, rect, texture, section, "A", inset_y);
+            }
+        }
+        if self.section_b_on {
+            if let (Some(texture), Some(section)) =
+                (self.section_b_tex.as_ref(), self.section_b_data.as_ref())
+            {
+                draw_section_inset(&painter, rect, texture, section, "B", inset_y);
+            }
+        }
+    }
+
+    fn ensure_cad_section_b_texture(&mut self, ctx: &egui::Context) {
+        if !self.section_b_on {
+            return;
+        }
+        let Some(case) = self.cad.as_ref() else {
+            return;
+        };
+        let Some(fields) = case.display_fields() else {
+            return;
+        };
+        let index = match engineering_section::section_index(fields.n, self.section_b_pos) {
+            Ok(index) => index,
+            Err(_) => return,
+        };
+        let step = case.display_step();
+        let signature = self.cad_version.wrapping_mul(409)
+            ^ self.section_b_axis.id().wrapping_mul(19)
+            ^ self.section_quantity.id().wrapping_mul(37)
+            ^ (index as u64).wrapping_mul(53)
+            ^ (step as u64).wrapping_mul(1_000_019);
+        if signature == self.section_b_sig && self.section_b_tex.is_some() {
+            return;
+        }
+        let reference_length_m = case.workflow.operating.reference_length
+            * case
+                .workflow
+                .operating
+                .length_unit
+                .meters_per_unit()
+                .unwrap_or(0.0);
+        let input = engineering_section::SectionInput {
+            n: fields.n,
+            velocity: fields.velocity,
+            pressure_pa: fields.pressure,
+            mask: fields.mask,
+            cp: fields.cp,
+            traction_pa: fields.traction,
+            free_stream_mps: case.workflow.operating.velocity as f32,
+            reference_pressure_pa: case.workflow.operating.reference_pressure as f32,
+            reference_length_m: reference_length_m as f32,
+            solver_characteristic_length: case.workflow.preflight.solver_characteristic_length
+                as f32,
+        };
+        match engineering_section::extract_section(
+            &input,
+            self.section_b_axis,
+            self.section_b_pos,
+            self.section_quantity,
+        ) {
+            Ok(mut section) => {
+                if self.section_quantity == engineering_section::SectionQuantity::PhysicalCp
+                    && self.settings.cp_range_mode == settings::CpRangeMode::Pinned
+                {
+                    section.scale = section.scale.pinned(self.settings.cp_pinned_extent as f32);
+                }
+                let image = engineering_section_image(&section);
+                self.section_b_tex = Some(ctx.load_texture(
+                    format!("engineering.section.b.{signature}"),
+                    image,
+                    egui::TextureOptions::NEAREST,
+                ));
+                self.section_b_data = Some(section);
+                self.section_b_sig = signature;
+            }
+            Err(_) => {
+                self.section_b_tex = None;
+                self.section_b_data = None;
+                self.section_b_sig = signature;
+            }
+        }
+    }
+
     fn cad_section_view(&mut self, ui: &mut egui::Ui, rect: Rect) {
         self.ensure_cad_section_texture(ui.ctx());
         let painter = ui.painter_at(rect);
@@ -18716,6 +19097,172 @@ fn engineering_section_legend(
         format_section_value(section.scale.legend_maximum(), section.quantity.units()),
         font,
         TEXT_MUTE,
+    );
+}
+
+fn draw_physical_colorbar(
+    painter: &egui::Painter,
+    viewport: Rect,
+    label: &str,
+    units: &str,
+    min: f32,
+    max: f32,
+    signed: bool,
+    source: &str,
+) {
+    let bar = Rect::from_min_size(
+        egui::pos2(viewport.max.x - 28.0, viewport.min.y + 48.0),
+        Vec2::new(10.0, (viewport.height() - 120.0).max(80.0)),
+    );
+    let strips = 64;
+    for strip in 0..strips {
+        let fraction = (strip as f32 + 0.5) / strips as f32;
+        let normalized = if signed {
+            1.0 - fraction * 2.0
+        } else {
+            1.0 - fraction
+        };
+        let y0 = bar.min.y + bar.height() * strip as f32 / strips as f32;
+        let y1 = bar.min.y + bar.height() * (strip + 1) as f32 / strips as f32;
+        painter.rect_filled(
+            Rect::from_min_max(egui::pos2(bar.min.x, y0), egui::pos2(bar.max.x, y1)),
+            CornerRadius::ZERO,
+            field2d::colormap_color(normalized, signed),
+        );
+    }
+    painter.rect_stroke(
+        bar,
+        CornerRadius::ZERO,
+        Stroke::new(1.0, OUTLINE_VARIANT),
+        egui::StrokeKind::Outside,
+    );
+    let font = FontId::monospace(9.5);
+    painter.text(
+        egui::pos2(bar.min.x - 6.0, bar.min.y),
+        Align2::RIGHT_TOP,
+        format_section_value(max, units),
+        font.clone(),
+        TEXT,
+    );
+    painter.text(
+        egui::pos2(bar.min.x - 6.0, bar.max.y),
+        Align2::RIGHT_BOTTOM,
+        format_section_value(min, units),
+        font.clone(),
+        TEXT,
+    );
+    painter.text(
+        egui::pos2(bar.min.x - 6.0, bar.min.y - 16.0),
+        Align2::RIGHT_BOTTOM,
+        label,
+        FontId::proportional(11.0),
+        TEXT,
+    );
+    painter.text(
+        egui::pos2(viewport.max.x - 16.0, viewport.min.y + 18.0),
+        Align2::RIGHT_TOP,
+        source,
+        FontId::monospace(9.0),
+        GOLD,
+    );
+}
+
+fn draw_section_inset(
+    painter: &egui::Painter,
+    viewport: Rect,
+    texture: &egui::TextureHandle,
+    section: &engineering_section::SectionPlane,
+    tag: &str,
+    bottom: f32,
+) -> f32 {
+    let size = 118.0;
+    let inset = Rect::from_min_size(
+        egui::pos2(viewport.min.x + 16.0, bottom - size - 8.0),
+        Vec2::splat(size),
+    );
+    painter.image(
+        texture.id(),
+        inset,
+        Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        Color32::WHITE,
+    );
+    painter.rect_stroke(
+        inset,
+        CornerRadius::same(2),
+        Stroke::new(1.0, OUTLINE),
+        egui::StrokeKind::Outside,
+    );
+    painter.text(
+        egui::pos2(inset.min.x, inset.min.y - 4.0),
+        Align2::LEFT_BOTTOM,
+        format!("{} · {} {:.2}", tag, section.axis.label(), section.location),
+        FontId::monospace(9.0),
+        GOLD,
+    );
+    inset.min.y
+}
+
+fn draw_line_probe_plot(ui: &mut egui::Ui, probe: &cad_postpro::LineProbe) {
+    if probe.samples.len() < 2 {
+        ui.label(
+            RichText::new("Probe has fewer than two fluid samples.")
+                .text_style(caption())
+                .color(TEXT_MUTE),
+        );
+        return;
+    }
+    let height = 112.0;
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width().max(160.0), height),
+        Sense::hover(),
+    );
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, CornerRadius::same(3), SURFACE);
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(3),
+        Stroke::new(1.0, OUTLINE_VARIANT),
+        egui::StrokeKind::Inside,
+    );
+    let chart = Rect::from_min_max(
+        rect.min + Vec2::new(8.0, 16.0),
+        rect.max - Vec2::new(8.0, 20.0),
+    );
+    let mut lo = probe
+        .samples
+        .iter()
+        .map(|(_, v)| *v)
+        .fold(f32::INFINITY, f32::min);
+    let mut hi = probe
+        .samples
+        .iter()
+        .map(|(_, v)| *v)
+        .fold(f32::NEG_INFINITY, f32::max);
+    if !lo.is_finite() || !hi.is_finite() {
+        return;
+    }
+    if (hi - lo).abs() < 1e-9 {
+        lo -= 0.1;
+        hi += 0.1;
+    }
+    let mut points = Vec::with_capacity(probe.samples.len());
+    for (s, value) in &probe.samples {
+        let x = chart.min.x + s.clamp(0.0, 1.0) * chart.width();
+        let y = chart.max.y - ((value - lo) / (hi - lo)) * chart.height();
+        points.push(egui::pos2(x, y));
+    }
+    painter.add(egui::Shape::line(points, Stroke::new(1.5, BRAND)));
+    painter.text(
+        egui::pos2(chart.min.x, rect.min.y + 4.0),
+        Align2::LEFT_TOP,
+        format!(
+            "{} {} vs s · {}",
+            probe.quantity.label(),
+            probe.quantity.units(),
+            probe.axis.label()
+        ),
+        FontId::monospace(9.0),
+        GOLD,
     );
 }
 

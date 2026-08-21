@@ -5,6 +5,7 @@
 //! native wgpu bloom renderer (`gpu.rs`, N2) which lights the vortex cores with
 //! a real HDR and bloom pass. A CPU halo+core fallback keeps the viewport
 //! working if wgpu is ever unavailable.
+use crate::cad_postpro::{self, Glyph};
 use crate::flow::Particle;
 use crate::gpu::{self, GpuInstance, SegInstance};
 use crate::theme::*;
@@ -516,6 +517,8 @@ pub struct ViewOpts {
     /// Model velocity for engineering streamlines. When present and
     /// `streamlines` is on, ribbons advect this field instead of the ABC demo.
     pub model_velocity: Option<ModelVelocityField>,
+    /// Decimated velocity arrows from the stored 32³ field. Empty when off.
+    pub glyphs: Vec<Glyph>,
 }
 
 /// HAZARD GATE. [`streamline_polys`] advects an **analytic ABC demo field**,
@@ -843,15 +846,15 @@ pub fn show(
             opts.streamlines,
             opts.model_velocity.is_some() && !opts.research_sandbox,
         );
-        let segments = if use_model {
+        let ppp = ui.ctx().pixels_per_point();
+        let project = |v: [f32; 3]| -> (Pos2, f32) {
+            match cam.project(rect, v) {
+                Some((screen, depth)) => (screen, depth),
+                None => (Pos2::new(f32::MAX, f32::MAX), -1.0),
+            }
+        };
+        let mut segments = if use_model {
             if let Some(field) = opts.model_velocity.as_ref() {
-                let ppp = ui.ctx().pixels_per_point();
-                let project = |v: [f32; 3]| -> (Pos2, f32) {
-                    match cam.project(rect, v) {
-                        Some((screen, depth)) => (screen, depth),
-                        None => (Pos2::new(f32::MAX, f32::MAX), -1.0),
-                    }
-                };
                 model_streamline_segments(&project, field, opts.fit_bounds, eye, rect, ppp)
             } else {
                 Vec::new()
@@ -859,6 +862,7 @@ pub fn show(
         } else {
             Vec::new()
         };
+        segments.extend(glyph_segments(&project, &opts.glyphs, rect, ppp));
         gpu::add_volume(
             ui,
             rect,
@@ -879,6 +883,16 @@ pub fn show(
                 rect.left_top() + egui::vec2(16.0, rect.height() - 44.0),
                 egui::Align2::LEFT_TOP,
                 MODEL_STREAMLINE_LABEL,
+                mono_s().resolve(ui.style()),
+                GOLD,
+            );
+        }
+        if !opts.glyphs.is_empty() {
+            let p = ui.painter_at(rect);
+            p.text(
+                rect.left_top() + egui::vec2(16.0, rect.height() - 28.0),
+                egui::Align2::LEFT_TOP,
+                "MODEL · velocity glyphs (every 2nd fluid cell)",
                 mono_s().resolve(ui.style()),
                 GOLD,
             );
@@ -1033,6 +1047,8 @@ pub fn show(
         } else {
             Vec::new()
         };
+        let mut segments = segments;
+        segments.extend(glyph_segments(&project, &opts.glyphs, rect, ppp));
         gpu::add_flow(ui, rect, instances, segments);
     } else {
         // CPU fallback: depth-sorted faint halo + bright core (soft glow, no GPU)
@@ -1358,6 +1374,47 @@ fn streamline_segments(
                 color: [1.5, 1.0, 0.35, 1.0], // gold, HDR
             });
         }
+    }
+    segs
+}
+
+fn glyph_segments(
+    project: &impl Fn([f32; 3]) -> (Pos2, f32),
+    glyphs: &[Glyph],
+    rect: Rect,
+    ppp: f32,
+) -> Vec<SegInstance> {
+    let to_ndc = |s: Pos2| {
+        [
+            (s.x - rect.min.x) / rect.width() * 2.0 - 1.0,
+            1.0 - (s.y - rect.min.y) / rect.height() * 2.0,
+        ]
+    };
+    let max_speed = glyphs
+        .iter()
+        .map(|glyph| glyph.speed)
+        .fold(1e-6f32, f32::max);
+    let mut segs = Vec::with_capacity(glyphs.len());
+    for glyph in glyphs {
+        let length = cad_postpro::GLYPH_LENGTH * (glyph.speed / max_speed).clamp(0.15, 1.5);
+        let tip = [
+            glyph.pos[0] + glyph.dir[0] * length,
+            glyph.pos[1] + glyph.dir[1] * length,
+            glyph.pos[2] + glyph.dir[2] * length,
+        ];
+        let (s0, _) = project(glyph.pos);
+        let (s1, _) = project(tip);
+        if s0.x > 1.0e10 || s1.x > 1.0e10 {
+            continue;
+        }
+        let t = (glyph.speed / max_speed).clamp(0.0, 1.0);
+        segs.push(SegInstance {
+            p0: to_ndc(s0),
+            p1: to_ndc(s1),
+            width_px: 1.35 * ppp,
+            _pad: 0.0,
+            color: [0.35 + 1.1 * t, 0.55 + 0.35 * t, 0.95 - 0.4 * t, 1.0],
+        });
     }
     segs
 }

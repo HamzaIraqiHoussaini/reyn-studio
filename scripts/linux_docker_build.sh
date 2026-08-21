@@ -3,7 +3,7 @@
 set -euo pipefail
 
 STUDIO_ROOT="${STUDIO_ROOT:-/work/pioneer/.worktrees/reyn-studio-step-import}"
-RESEARCH_ROOT="${RESEARCH_ROOT:-/work/pioneer/.release/reyn-research-3515/reyn-research}"
+RESEARCH_ROOT="${RESEARCH_ROOT:-/work/pioneer/.release/reyn-research-c9a9/reyn-research}"
 SKIP_CARGO_BUILD="${SKIP_CARGO_BUILD:-0}"
 SOURCE_REVISION="${SOURCE_REVISION:?SOURCE_REVISION must be set from the host}"
 RESEARCH_REVISION="${RESEARCH_REVISION:?RESEARCH_REVISION must be set from the host}"
@@ -18,6 +18,12 @@ export PATH="/opt/cargo/bin:/root/.cargo/bin:/usr/local/bin:$PATH"
 export APPIMAGE_EXTRACT_AND_RUN=1
 
 cd "$STUDIO_ROOT"
+
+actual_research=$(git -C "$RESEARCH_ROOT" rev-parse HEAD)
+if [[ "$actual_research" != "$RESEARCH_REVISION" ]]; then
+  echo "research checkout HEAD $actual_research does not match RESEARCH_REVISION $RESEARCH_REVISION" >&2
+  exit 1
+fi
 
 echo "==> apt packages"
 apt-get update -qq

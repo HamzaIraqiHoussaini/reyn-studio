@@ -25,7 +25,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: videochataiai/reyn
-          ref: 3515cde4d0f5678437ad6ee6116774f1cd6a3c16
+          ref: 2339de95e2f60ecb04187a68a7257f9713bd65e6
           path: reyn-monorepo
           ssh-key: ${{ secrets.REYN_RESEARCH_DEPLOY_KEY }}
           persist-credentials: false

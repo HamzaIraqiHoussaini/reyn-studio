@@ -29,7 +29,7 @@ from linux_packaging import (  # noqa: E402
 
 class LinuxPackagingTests(unittest.TestCase):
     def make_stage(self, root: Path) -> Path:
-        stage = root / "Reyn-Studio-0.4.0-linux-x86_64"
+        stage = root / "Reyn-Studio-0.4.1-linux-x86_64"
         required = (
             "reyn-studio",
             "ReynStudio.png",

@@ -152,11 +152,16 @@ def package(args: argparse.Namespace) -> int:
     version = cargo_version(root)
     runtime = args.runtime_dir.absolute()
     research = resolve_research_source(root, args.research_source_dir)
-    research_revision = args.research_revision or git_revision(research)
+    research_revision = git_revision(research)
     if research_revision != pins["research_revision"]:
         raise ValueError(
             f"research revision {research_revision} does not match release pin "
             f"{pins['research_revision']}"
+        )
+    if args.research_revision and args.research_revision != research_revision:
+        raise ValueError(
+            f"--research-revision {args.research_revision} does not match checkout "
+            f"{research_revision}"
         )
     output = (root / args.output_dir).absolute()
     target = (root / args.target_dir).absolute()

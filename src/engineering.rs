@@ -816,10 +816,7 @@ impl ModelSupport {
                 self.grid, target_grid
             ));
         }
-        if !matches!(
-            (self.input_channels, self.output_channels),
-            (4, 3) | (5, 3)
-        ) {
+        if !matches!((self.input_channels, self.output_channels), (4, 3) | (5, 3)) {
             issues.push(format!(
                 "CAD Run requires 4→3 or 5→3 channels on this 3D obstacle path; this model is {}→{}.",
                 self.input_channels, self.output_channels

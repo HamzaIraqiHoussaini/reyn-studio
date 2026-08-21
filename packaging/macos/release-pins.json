@@ -1,7 +1,7 @@
 {
   "schema": "com.reyn.studio.macos-release-pins.v1",
   "research_repository": "videochataiai/reyn",
-  "research_revision": "829607178d76ee60441e687e5a247b49e74dbd28",
+  "research_revision": "2339de95e2f60ecb04187a68a7257f9713bd65e6",
   "research_subdirectory": "reyn-research",
   "runtime_architecture": "arm64",
   "minimum_compute_macos": "14.0",

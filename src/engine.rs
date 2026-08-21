@@ -195,10 +195,7 @@ pub fn derive_model_qualification_class(
     MODEL_QUALIFICATION_UNKNOWN.into()
 }
 
-pub fn external_flow_research_operator_allowed(
-    model: &ModelCard,
-    target_grid: usize,
-) -> bool {
+pub fn external_flow_research_operator_allowed(model: &ModelCard, target_grid: usize) -> bool {
     model.qualification_class == MODEL_QUALIFICATION_RESEARCH
         && model.dimension == 3
         && model.grid == 32
@@ -247,10 +244,7 @@ pub fn external_flow_model_issues(model: &ModelCard, target_grid: usize) -> Vec<
             model.grid, target_grid
         ));
     }
-    if !matches!(
-        (model.in_channels, model.out_channels),
-        (4, 3) | (5, 3)
-    ) {
+    if !matches!((model.in_channels, model.out_channels), (4, 3) | (5, 3)) {
         issues.push(format!(
             "channels are {}→{}, not a 4→3 or 5→3 3D obstacle contract",
             model.in_channels, model.out_channels
@@ -2943,7 +2937,9 @@ assert loaded.authenticity["status"] == "development_unsigned_override"
             publisher_key_sha256: Some("b".repeat(64)),
             release_sequence: Some(1),
             support: Vec::new(),
-            limitations: vec!["Research 3D obstacle operator. Not production-qualified CFD.".into()],
+            limitations: vec![
+                "Research 3D obstacle operator. Not production-qualified CFD.".into(),
+            ],
             benchmark_report_hashes: Vec::new(),
             unknown_fields: Vec::new(),
             qualification_class: MODEL_QUALIFICATION_RESEARCH.into(),
