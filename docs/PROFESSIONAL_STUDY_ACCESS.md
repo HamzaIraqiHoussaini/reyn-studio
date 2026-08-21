@@ -25,10 +25,15 @@ The 3D model selector is capability-driven:
 - a missing stored model keeps its recorded identity and blocks execution;
 - the bundled 2D H64 model is never presented as a 3D option.
 
+Research 3D evidence is the 32³ one-jump obstacle operator (RelL2 0.052 at 128
+steps, 32,768 cells). CAD Run voxels the case to that declared grid. A missing
+or mismatched signed bundle keeps Run disabled with that reason.
+
 Qualification requires a canonical `.reynmodel` identity, verified publisher
-authenticity, CLEAN status, 3D H64 geometry conditioning, the exact 4→3 channel
-contract, fixed-body obstacle scenario, `fixed_body_brinkman.v1`, a supported
-horizon, and a canonical checkpoint SHA-256.
+authenticity, CLEAN status, 3D geometry conditioning at the model's declared
+grid (32³ for the current operator), a 4→3 or 5→3 channel contract, fixed-body
+obstacle scenario, `fixed_body_brinkman.v1`, a supported horizon, and a canonical
+checkpoint SHA-256.
 
 Review Focus is versioned in the case contract. It can lead with supported force
 or moment components, Cp extrema, or wake-deficit quantities. It changes Results

@@ -367,7 +367,7 @@ const LIVE_REPAINT_INTERVAL: std::time::Duration = std::time::Duration::from_mil
 /// Model-independent grid used only to inspect geometry before a qualified
 /// model exists. Execution remains blocked until a verified model with this
 /// grid is selected.
-const DIAGNOSTIC_PREFLIGHT_GRID: usize = 64;
+const DIAGNOSTIC_PREFLIGHT_GRID: usize = 32;
 
 struct OrientationWorkRequest {
     generation: u64,
@@ -13326,6 +13326,12 @@ impl ReynApp {
                 self.models
                     .iter()
                     .filter(compatible)
+                    .find(|card| card.grid == 32)
+            })
+            .or_else(|| {
+                self.models
+                    .iter()
+                    .filter(compatible)
                     .max_by_key(|card| card.grid)
             })
             .map(|card| card.grid as usize)
@@ -13588,7 +13594,7 @@ impl ReynApp {
                         ..Default::default()
                     },
                     Some(format!(
-                        "MODEL GATE · Geometry was inspected on the model-independent {}³ diagnostic grid. Inference remains blocked until a compatible verified 3D .reynmodel bundle with a matching grid is selected.",
+                        "MODEL GATE · Geometry was inspected on the {}³ grid that matches the current 3D operator (32,768 cells at 32³). Inference remains blocked until a compatible verified model for that grid is selected.",
                         vm.n
                     )),
                 )

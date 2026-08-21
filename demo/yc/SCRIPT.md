@@ -8,6 +8,8 @@ format: screen-only with founder narration
 
 This is the current supported flow. `REFERENCE_RUN_BLOCKER.md` explains why a
 reference-solver field is not loaded into Results yet. Do not show a fabricated result.
+Research 3D evidence is the 32³ one-jump obstacle operator (RelL2 0.052 at 128 steps,
+32,768 cells). CAD Run voxels the case to that declared grid.
 
 ## 00:00–00:15 — Start with the engineering problem
 

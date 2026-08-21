@@ -1,0 +1,15 @@
+{
+  "bundle_sha256": "0e0524e9c665b1b46138721d2448198d3224347f1cba324e90a757eda2bbe570",
+  "model": {
+    "id": "reyn-flow3d-obstacle-32",
+    "version": "1.0.0-research"
+  },
+  "qualification_boundary": "Authenticated 32³ 5→3 research operator. Not production-qualified CFD.",
+  "schema": "com.reyn.research-model-release/1",
+  "signature_key_id": "reyn-yc-model-2026-01",
+  "source_checkpoint": {
+    "sha256": "38eccfb9e2bdbefce7a290e7493da1afbb5103568a5cd39dda1b1f02ae2eaf3c"
+  },
+  "tuf_root_sha256": "a713d759f4f3549dad76a20dc6342275f3f07c2fe455cf7352dce66ddd5381f1",
+  "weights_sha256": "e305126859a906f2afd492e42e21c756355be2722cc49ed8c523d2c5c330ea7b"
+}

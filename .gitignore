@@ -29,6 +29,8 @@ __pycache__/
 *.reynmodel.sig
 !packaging/models/yc-preview-h64/*.reynmodel
 !packaging/models/yc-preview-h64/*.reynmodel.sig
+!packaging/models/flow3d-obstacle-32/*.reynmodel
+!packaging/models/flow3d-obstacle-32/*.reynmodel.sig
 *.app
 *.zip
 *.profraw

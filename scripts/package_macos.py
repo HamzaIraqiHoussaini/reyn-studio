@@ -18,12 +18,14 @@ from pathlib import Path
 from macos_packaging import (
     DEFAULT_SOURCE_DATE_EPOCH,
     ENGINE_RESOURCES,
+    FLOW3D_RESEARCH_MODEL_MANIFEST,
     PACKAGE_RUST_TARGETS,
     RESEARCH_RESOURCES,
     RUST_TARGET_ARCHITECTURES,
     TARGET_ARCHITECTURES,
     copy_documentation_resources,
     copy_engine_resources,
+    copy_flow3d_research_model_resources,
     copy_preview_model_resources,
     copy_research_resources,
     copy_security_resources,
@@ -101,6 +103,7 @@ def package_input_fingerprint(root: Path, research_source: Path) -> str:
             *sorted((root / "assets").rglob("*")),
             *(root / "engine" / name for name in ENGINE_RESOURCES),
             *sorted((root / "packaging/models/yc-preview-h64").rglob("*")),
+            *sorted((root / "packaging/models/flow3d-obstacle-32").rglob("*")),
             *sorted((root / "packaging/macos").glob("*")),
             root / "scripts/macos_packaging.py",
             root / "scripts/package_macos.py",
@@ -354,6 +357,7 @@ def package(args: argparse.Namespace) -> int:
         copy_engine_resources(root, resources / "engine")
         copy_research_resources(research_source, resources / "research")
         copy_preview_model_resources(root, resources)
+        copy_flow3d_research_model_resources(root, resources)
         copy_security_resources(root, resources / "security")
         write_json(resources / "runtime-requirements.json", runtime_requirements())
         runtime_manifest = stage_factory_runtime(
@@ -423,7 +427,12 @@ def package(args: argparse.Namespace) -> int:
                     (resources / "docs/models/model-release-manifest.json").read_text(
                         encoding="utf-8"
                     )
-                )
+                ),
+                json.loads(
+                    (
+                        resources / "docs/models" / FLOW3D_RESEARCH_MODEL_MANIFEST
+                    ).read_text(encoding="utf-8")
+                ),
             ],
             "resource_set": resource_metadata(resources),
             "preview_access": access_contract,

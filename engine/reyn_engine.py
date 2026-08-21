@@ -108,18 +108,16 @@ def derive_model_qualification_class(version, limitations, status):
     """Mirror Studio's fail-closed release class for model cards."""
     version_text = str(version or "").strip().lower()
     limitation_blob = "\n".join(str(item).lower() for item in (limitations or []))
+    if "yc-preview" in version_text or "preview" in version_text:
+        return "preview"
+    if "research" in version_text:
+        return "research"
     if (
-        "yc-preview" in version_text
-        or "preview" in version_text
+        "yc research preview" in limitation_blob
         or "not production-qualified" in limitation_blob
-        or "yc research preview" in limitation_blob
     ):
         return "preview"
-    if (
-        "research" in limitation_blob
-        or "not production" in limitation_blob
-        or "research" in version_text
-    ):
+    if "research" in limitation_blob or "not production" in limitation_blob:
         return "research"
     if (
         status == "clean"
@@ -998,10 +996,11 @@ class Engine:
         )
         if is3d:
             supported_contract = (
-                (in_channels, out_channels, param_dim) in ((3, 3, 0), (4, 3, 0))
+                (in_channels, out_channels, param_dim)
+                in ((3, 3, 0), (4, 3, 0), (5, 3, 0))
                 and (
                     (inferred_scenario == "free" and in_channels == 3)
-                    or (inferred_scenario == "obstacle" and in_channels == 4)
+                    or (inferred_scenario == "obstacle" and in_channels in (4, 5))
                 )
             )
             if train_args.get("nu") is None:
@@ -1399,6 +1398,61 @@ class Engine:
         self.cache[path] = info
         return info
 
+    def _normalized_log_viscosity_channel(self, nu, bounds, like):
+        torch = self.torch
+        low, high = float(bounds[0]), float(bounds[1])
+        value = float(nu)
+        if not 0.0 < low < high:
+            raise ValueError("invalid viscosity normalization bounds")
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError("viscosity must be finite and positive")
+        if value < low or value > high:
+            raise ValueError(
+                f"viscosity {value:g} leaves model bounds [{low:g}, {high:g}]"
+            )
+        mapped = 2.0 * (math.log(value) - math.log(low)) / (
+            math.log(high) - math.log(low)
+        ) - 1.0
+        return torch.full(
+            (like.shape[0], 1, like.shape[2], like.shape[3], like.shape[4]),
+            mapped,
+            dtype=like.dtype,
+            device=like.device,
+        )
+
+    def _signed_log_viscosity_bounds(self, info):
+        support = ((info.get("physics_spec") or {}).get("support") or {})
+        nu = support.get("nu")
+        if isinstance(nu, (list, tuple)) and len(nu) == 2:
+            lo, hi = float(nu[0]), float(nu[1])
+            if hi > lo > 0.0:
+                return (lo, hi)
+        raise ValueError(
+            "5-channel 3D packing requires signed support_envelope.physics.nu bounds"
+        )
+
+    def _pack_obstacle_3d(self, info, velocity, mask, nu=None):
+        torch = self.torch
+        in_channels = int(info["cfg"].get("in_channels", 4))
+        if mask.ndim == 4:
+            mask = mask.unsqueeze(1) if mask.shape[1] != 1 else mask
+        if in_channels == 4:
+            return torch.cat([velocity, mask], dim=1)
+        if in_channels == 5:
+            if nu is None:
+                nu = info["ta"].get("nu")
+            log_nu = self._normalized_log_viscosity_channel(
+                nu, self._signed_log_viscosity_bounds(info), velocity
+            )
+            packed = torch.cat([velocity, mask, log_nu], dim=1)
+            if packed.size(1) != 5:
+                raise ValueError("five-channel 3D packing failed")
+            return packed
+        raise ValueError(
+            f"unsupported 3D obstacle packing {in_channels}→"
+            f"{info['cfg'].get('out_channels')}"
+        )
+
     def predict_field(self, req):
         torch = self.torch
         path = req["model"]
@@ -1418,7 +1472,11 @@ class Engine:
                                seq_len=horizon + 1, stride=ta["stride"], seed=seed + 50000)
             y0 = ds.trajectories[0][0:1]
             mask = ds.masks[0].unsqueeze(0)
-            model_in = torch.cat([y0, mask], dim=1) if scenario == "obstacle" else y0
+            model_in = (
+                self._pack_obstacle_3d(info, y0, mask, nu=ta.get("nu"))
+                if scenario == "obstacle"
+                else y0
+            )
             with torch.no_grad():
                 pred = m(model_in.to(self.device), torch.tensor([[horizon * dt_frame]], device=self.device))
             field = pred[0].cpu().contiguous().numpy().astype(np.float32)  # [3, N, N, N]
@@ -1793,8 +1851,11 @@ class Engine:
         with torch.no_grad():
             # Engineering CAD path: one forward only. Semigroup self-consistency
             # stays in the 2D research sandbox — not on the customer hot path.
-            model_in = torch.cat(
-                [developed, mask_s.reshape(1, 1, N, N, N)], dim=1
+            model_in = self._pack_obstacle_3d(
+                info,
+                developed,
+                mask_s.reshape(1, 1, N, N, N),
+                nu=nu,
             ).to(device)
             pred = m(model_in, torch.tensor([[horizon * dt_frame]], device=device)).cpu()
             report("predicting", 3, f"Model horizon step {horizon} complete", 1.0)

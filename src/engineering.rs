@@ -798,39 +798,42 @@ impl ModelSupport {
         let mut issues = Vec::new();
         if self.status == "unavailable" {
             issues.push(
-                "No compatible verified 3D .reynmodel bundle is available; geometry review is available, but inference is blocked."
+                "No compatible verified 3D model matching this case grid is available. CAD Run voxels to the model's declared grid (32³, 32,768 cells for the current 3D operator). Inference is blocked until that signed bundle is selected."
                     .into(),
             );
         } else if self.status != "clean" {
             issues.push(format!(
-                "The selected checkpoint qualification state {:?} is not CLEAN.",
+                "The selected model qualification state {:?} is not CLEAN.",
                 self.status
             ));
         }
         if self.dimension != 3 {
-            issues.push("External-geometry execution requires a 3D checkpoint.".into());
+            issues.push("External-geometry execution requires a 3D model.".into());
         }
         if self.grid as usize != target_grid {
             issues.push(format!(
-                "The checkpoint grid {}³ does not match preprocessing grid {}³.",
+                "The model grid {}³ does not match the preprocessing grid {}³.",
                 self.grid, target_grid
             ));
         }
-        if self.input_channels <= self.output_channels || self.output_channels != 3 {
+        if !matches!(
+            (self.input_channels, self.output_channels),
+            (4, 3) | (5, 3)
+        ) {
             issues.push(format!(
-                "The checkpoint channel contract {}→{} is not geometry-conditioned 3D velocity.",
+                "CAD Run requires 4→3 or 5→3 channels on this 3D obstacle path; this model is {}→{}.",
                 self.input_channels, self.output_channels
             ));
         }
         if self.scenario != "obstacle" {
             issues.push(format!(
-                "The checkpoint scenario {:?} is not the supported fixed-body obstacle regime.",
+                "The model scenario {:?} is not the supported fixed-body obstacle regime.",
                 self.scenario
             ));
         }
         if self.physics_contract != crate::engine::EXTERNAL_FLOW_MODEL_PHYSICS_CONTRACT {
             issues.push(format!(
-                "The checkpoint physics contract {:?} is not {}.",
+                "The model physics contract {:?} is not {}.",
                 self.physics_contract,
                 crate::engine::EXTERNAL_FLOW_MODEL_PHYSICS_CONTRACT
             ));
@@ -2239,7 +2242,27 @@ mod tests {
         assert!(unavailable
             .validation(64)
             .iter()
-            .any(|issue| issue.contains("inference is blocked")));
+            .any(|issue| issue.to_ascii_lowercase().contains("inference is blocked")));
+
+        let research_32_five_channel = ModelSupport {
+            status: "clean".into(),
+            dimension: 3,
+            grid: 32,
+            input_channels: 5,
+            output_channels: 3,
+            scenario: "obstacle".into(),
+            physics_contract: crate::engine::EXTERNAL_FLOW_MODEL_PHYSICS_CONTRACT.into(),
+        };
+        let matched = research_32_five_channel.validation(32);
+        assert!(
+            !matched
+                .iter()
+                .any(|issue| issue.contains("4→3") || issue.contains("does not match")),
+            "{matched:?}"
+        );
+        let research_issues = research_32_five_channel.validation(64);
+        assert!(research_issues.iter().any(|issue| issue.contains("32³")));
+        assert!(!research_issues.iter().any(|issue| issue.contains("4→3")));
     }
 
     #[test]

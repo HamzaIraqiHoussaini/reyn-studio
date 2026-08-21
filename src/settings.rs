@@ -503,8 +503,12 @@ impl AppSettings {
     }
 
     fn migrate_legacy_model_defaults(&mut self) -> bool {
-        migrate_legacy_model_id(&mut self.default_3d_model, DEFAULT_3D_MODEL_ID)
-            | migrate_legacy_model_id(&mut self.default_2d_model, DEFAULT_2D_MODEL_ID)
+        let migrated = migrate_legacy_model_id(&mut self.default_3d_model, DEFAULT_3D_MODEL_ID)
+            | migrate_legacy_model_id(&mut self.default_2d_model, DEFAULT_2D_MODEL_ID);
+        if self.default_3d_model == "flow3d_obs_v1.reynmodel" {
+            self.default_3d_model = DEFAULT_3D_MODEL_ID.into();
+        }
+        migrated
     }
 
     /// The active display format for numeric values.
@@ -3271,7 +3275,7 @@ mod tests {
         .unwrap();
 
         let (settings, warning) = AppSettings::load_from_path(&path);
-        assert_eq!(settings.default_3d_model, "flow3d_obs_v1.reynmodel");
+        assert_eq!(settings.default_3d_model, DEFAULT_3D_MODEL_ID);
         assert_eq!(
             settings.default_2d_model,
             "reyn_models/obstacle_v2_shapes.reynmodel"
@@ -3283,7 +3287,7 @@ mod tests {
 
         save_to(&settings, &path).unwrap();
         let persisted = std::fs::read_to_string(&path).unwrap();
-        assert!(persisted.contains("flow3d_obs_v1.reynmodel"));
+        assert!(persisted.contains(DEFAULT_3D_MODEL_ID));
         assert!(!persisted.contains(".pth"));
         let _ = std::fs::remove_dir_all(root);
     }

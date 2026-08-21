@@ -38,10 +38,13 @@ RESEARCH_RESOURCES = (
     "flow_contract.py",
     "flow_quantities.py",
     "models_3d.py",
+    "occupancy_geometry_3d.py",
     "obstacle_dataset.py",
     "obstacle_solver.py",
     "obstacle_solver_3d.py",
     "physics_losses.py",
+    "pressure_channel_contract_3d.py",
+    "pressure_model_contract_3d.py",
     "spectral_solver.py",
     "spectral_solver_3d.py",
     "time_moe_operator.py",
@@ -56,6 +59,13 @@ PREVIEW_MODEL_EVIDENCE = (
     "h64_v3_tail_brinkman_factorial_summary.json",
     "h64_v3_tail_brinkman_combined_replication_summary.json",
 )
+FLOW3D_RESEARCH_MODEL_ROOT = Path("packaging/models/flow3d-obstacle-32")
+FLOW3D_RESEARCH_MODEL_NAME = "reyn-flow3d-obstacle-32-v1.reynmodel"
+FLOW3D_RESEARCH_MODEL_FILES = (
+    FLOW3D_RESEARCH_MODEL_NAME,
+    f"{FLOW3D_RESEARCH_MODEL_NAME}.sig",
+)
+FLOW3D_RESEARCH_MODEL_MANIFEST = "flow3d-obstacle-32-model-release-manifest.json"
 SECURITY_RESOURCES = (
     "MODEL_TRUST_CONTRACT.json",
     "SBOM.spdx.json",
@@ -2328,4 +2338,26 @@ def copy_preview_model_resources(root: Path, resources: Path) -> list[Path]:
         target = documentation / name
         shutil.copy2(source / "evidence" / name, target)
         copied.append(target)
+    return copied
+
+
+def copy_flow3d_research_model_resources(root: Path, resources: Path) -> list[Path]:
+    source = root / FLOW3D_RESEARCH_MODEL_ROOT
+    research = resources / "research"
+    documentation = resources / "docs/models"
+    research.mkdir(parents=True, exist_ok=True)
+    documentation.mkdir(parents=True, exist_ok=True)
+    copied: list[Path] = []
+    for name in FLOW3D_RESEARCH_MODEL_FILES:
+        target = research / name
+        shutil.copy2(source / name, target)
+        target.chmod(target.stat().st_mode | 0o644)
+        copied.append(target)
+    repository = source / f"{FLOW3D_RESEARCH_MODEL_NAME}.tuf"
+    repository_target = research / repository.name
+    shutil.copytree(repository, repository_target)
+    copied.extend(path for path in repository_target.rglob("*") if path.is_file())
+    manifest_target = documentation / FLOW3D_RESEARCH_MODEL_MANIFEST
+    shutil.copy2(source / "model-release-manifest.json", manifest_target)
+    copied.append(manifest_target)
     return copied

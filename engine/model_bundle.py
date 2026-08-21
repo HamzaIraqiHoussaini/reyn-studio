@@ -1974,6 +1974,58 @@ def _semantics(architecture_id: str, config: dict, support: dict, physics_id: st
                 "support_envelope.scenario",
                 "fixed-body-v2 models require the obstacle scenario",
             )
+    elif dimension == 3 and (in_channels, out_channels, param_dim) == (5, 3, 0):
+        obstacle = True
+        expected_physics = "fixed_body_brinkman.v1"
+        packing = "velocity+solid_fraction+log_viscosity"
+        spatial = ["solid_fraction"]
+        global_values = ["log_kinematic_viscosity"]
+        normalization["spatial_conditions"] = {
+            "solid_fraction": {"kind": "identity", "input_range": [0.0, 1.0]}
+        }
+        _exact_keys(
+            physics,
+            ("kinematic_viscosity", "nu"),
+            "support_envelope.physics",
+        )
+        _finite_number(
+            physics["kinematic_viscosity"],
+            "support_envelope.physics.kinematic_viscosity",
+            positive=True,
+        )
+        nu = physics["nu"]
+        if not isinstance(nu, (list, tuple)) or len(nu) != 2:
+            _fail(
+                "bundle.support_mismatch",
+                "support_envelope.physics.nu",
+                "5-channel 3D models require signed [min, max] viscosity bounds",
+            )
+        nu_lo = _finite_number(
+            nu[0], "support_envelope.physics.nu[0]", positive=True
+        )
+        nu_hi = _finite_number(
+            nu[1], "support_envelope.physics.nu[1]", positive=True
+        )
+        if nu_hi <= nu_lo:
+            _fail(
+                "bundle.support_mismatch",
+                "support_envelope.physics.nu",
+                "max viscosity must exceed min viscosity",
+            )
+        physics["nu"] = [nu_lo, nu_hi]
+        normalization["global_conditions"] = {
+            "log_kinematic_viscosity": {
+                "kind": "log_affine",
+                "input_bounds": physics["nu"],
+                "output_bounds": [-1.0, 1.0],
+            }
+        }
+        if support["scenario"] != "obstacle":
+            _fail(
+                "bundle.support_mismatch",
+                "support_envelope.scenario",
+                "5-channel 3D models require the obstacle scenario",
+            )
     elif dimension == 3 and (in_channels, out_channels, param_dim) in (
         (3, 3, 0),
         (4, 3, 0),
@@ -2899,6 +2951,15 @@ def _support_from_checkpoint(checkpoint: Mapping, architecture_id: str) -> dict:
         }
     elif architecture_id == ARCHITECTURE_3D:
         physics = {"kinematic_viscosity": train_args.get("nu")}
+        if int(config["in_channels"]) == 5:
+            bounds = train_args.get("nu_bounds")
+            if not isinstance(bounds, (list, tuple)) or len(bounds) != 2:
+                _fail(
+                    "bundle.missing_metadata",
+                    "train_args.nu_bounds",
+                    "5-channel 3D conversion requires nu_bounds [min, max]",
+                )
+            physics["nu"] = [float(bounds[0]), float(bounds[1])]
     return {
         "dimension": 2 if architecture_id == ARCHITECTURE_2D else 3,
         "grid_size": grid_size,
@@ -3033,7 +3094,7 @@ def write_model_bundle(
     else:
         physics_id = (
             "fixed_body_brinkman.v1"
-            if normalized_config["in_channels"] == 4
+            if normalized_config["in_channels"] in (4, 5)
             else "free_periodic.v1"
         )
     io_schema, normalization, conditioning = _semantics(

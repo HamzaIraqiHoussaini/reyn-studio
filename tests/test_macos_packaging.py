@@ -22,6 +22,9 @@ from macos_packaging import (  # noqa: E402
     DEFAULT_SOURCE_DATE_EPOCH,
     DOCUMENTATION_RESOURCES,
     ENGINE_RESOURCES,
+    FLOW3D_RESEARCH_MODEL_FILES,
+    FLOW3D_RESEARCH_MODEL_MANIFEST,
+    FLOW3D_RESEARCH_MODEL_NAME,
     PACKAGE_RUST_TARGETS,
     PROJECT_EXTENSIONS,
     RESEARCH_RESOURCES,
@@ -31,6 +34,7 @@ from macos_packaging import (  # noqa: E402
     TEMPLATE_EXTENSIONS,
     copy_documentation_resources,
     copy_engine_resources,
+    copy_flow3d_research_model_resources,
     copy_research_resources,
     copy_security_resources,
     developer_id_sign,
@@ -564,6 +568,27 @@ class MacOSPackagingTests(unittest.TestCase):
             self.assertFalse(any(destination.rglob("test_*.py")))
             self.assertFalse(any(destination.rglob("*.pth")))
             self.assertEqual(developer_path_leaks(bundle), [])
+
+    def test_flow3d_research_model_copies_into_bundled_research(self):
+        with tempfile.TemporaryDirectory() as directory:
+            resources = Path(directory) / "Resources"
+            copied = copy_flow3d_research_model_resources(ROOT, resources)
+            names = {path.name for path in copied}
+            self.assertTrue(set(FLOW3D_RESEARCH_MODEL_FILES).issubset(names))
+            self.assertIn(FLOW3D_RESEARCH_MODEL_MANIFEST, names)
+            bundle = resources / "research" / FLOW3D_RESEARCH_MODEL_NAME
+            self.assertTrue(bundle.is_file())
+            self.assertTrue(bundle.stat().st_size > 0)
+            self.assertTrue((resources / f"research/{FLOW3D_RESEARCH_MODEL_NAME}.sig").is_file())
+            self.assertTrue((resources / f"research/{FLOW3D_RESEARCH_MODEL_NAME}.tuf").is_dir())
+            manifest = json.loads(
+                (
+                    resources / "docs/models" / FLOW3D_RESEARCH_MODEL_MANIFEST
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["schema"], "com.reyn.research-model-release/1")
+            self.assertEqual(manifest["model"]["id"], "reyn-flow3d-obstacle-32")
+            self.assertFalse(any(resources.rglob("*.pth")))
 
     def test_research_resource_list_is_the_sidecar_import_closure(self):
         research_source = resolve_research_source(ROOT)

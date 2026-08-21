@@ -29,7 +29,7 @@ const ENGINE_CAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(360);
 const DEVELOPMENT_UNSIGNED_FIXTURE_MARKER: &str = ".development-unsigned-model-fixture";
 pub const MODEL_BUNDLE_EXTENSION: &str = "reynmodel";
 pub const MODEL_SIGNATURE_SUFFIX: &str = ".sig";
-pub const DEFAULT_3D_MODEL_ID: &str = "flow3d_obs_v1.reynmodel";
+pub const DEFAULT_3D_MODEL_ID: &str = "reyn-flow3d-obstacle-32-v1.reynmodel";
 pub const DEFAULT_2D_MODEL_ID: &str = "reyn-h64-tail-brinkman-seed0-v1.reynmodel";
 pub const TRUSTED_MODEL_CONVERSION_GUIDANCE: &str =
     "Production inference requires a verified .reynmodel bundle and its adjacent \
@@ -49,9 +49,12 @@ const REQUIRED_RESEARCH_MODULES: &[&str] = &[
     "flow_contract.py",
     "flow_quantities.py",
     "models_3d.py",
+    "occupancy_geometry_3d.py",
     "obstacle_dataset.py",
     "obstacle_solver.py",
     "obstacle_solver_3d.py",
+    "pressure_channel_contract_3d.py",
+    "pressure_model_contract_3d.py",
     "spectral_solver.py",
     "spectral_solver_3d.py",
     "time_moe_operator.py",
@@ -125,7 +128,8 @@ pub struct ModelCard {
     /// Fail-closed release class for Studio execution claims.
     ///
     /// - `production`: may qualify for external-flow CAD when the contract matches
-    /// - `preview` / `research`: authenticatable and inspectable, never production CAD
+    /// - `preview`: authenticatable and inspectable; never CAD
+    /// - `research`: authenticatable; CAD only for the signed 32³ 5→3 obstacle operator
     /// - `unknown`: treated as incomplete
     pub qualification_class: String,
 }
@@ -168,17 +172,18 @@ pub fn derive_model_qualification_class(
         .map(|line| line.to_ascii_lowercase())
         .collect::<Vec<_>>()
         .join("\n");
-    if version.contains("yc-preview")
-        || version.contains("preview")
+    if version.contains("yc-preview") || version.contains("preview") {
+        return MODEL_QUALIFICATION_PREVIEW.into();
+    }
+    if version.contains("research") {
+        return MODEL_QUALIFICATION_RESEARCH.into();
+    }
+    if limitation_blob.contains("yc research preview")
         || limitation_blob.contains("not production-qualified")
-        || limitation_blob.contains("yc research preview")
     {
         return MODEL_QUALIFICATION_PREVIEW.into();
     }
-    if limitation_blob.contains("research")
-        || limitation_blob.contains("not production")
-        || version.contains("research")
-    {
+    if limitation_blob.contains("research") || limitation_blob.contains("not production") {
         return MODEL_QUALIFICATION_RESEARCH.into();
     }
     if status == "clean"
@@ -190,6 +195,20 @@ pub fn derive_model_qualification_class(
     MODEL_QUALIFICATION_UNKNOWN.into()
 }
 
+pub fn external_flow_research_operator_allowed(
+    model: &ModelCard,
+    target_grid: usize,
+) -> bool {
+    model.qualification_class == MODEL_QUALIFICATION_RESEARCH
+        && model.dimension == 3
+        && model.grid == 32
+        && target_grid == 32
+        && model.in_channels == 5
+        && model.out_channels == 3
+        && model.scenario == "obstacle"
+        && model.physics_contract == EXTERNAL_FLOW_MODEL_PHYSICS_CONTRACT
+}
+
 pub fn external_flow_model_issues(model: &ModelCard, target_grid: usize) -> Vec<String> {
     let mut issues = Vec::new();
     if !is_model_bundle_id(&model.id) {
@@ -198,9 +217,10 @@ pub fn external_flow_model_issues(model: &ModelCard, target_grid: usize) -> Vec<
     if !model_authenticity_allows_external_flow(&model.authenticity_status) {
         issues.push("publisher authenticity is not verified".into());
     }
-    if model.qualification_class != MODEL_QUALIFICATION_PRODUCTION {
+    let research_cad = external_flow_research_operator_allowed(model, target_grid);
+    if model.qualification_class != MODEL_QUALIFICATION_PRODUCTION && !research_cad {
         issues.push(format!(
-            "qualification class is {}, not production (preview/research packs cannot run external-flow CAD)",
+            "qualification class is {}, not production (preview packs cannot run external-flow CAD)",
             if model.qualification_class.trim().is_empty() {
                 MODEL_QUALIFICATION_UNKNOWN
             } else {
@@ -227,9 +247,12 @@ pub fn external_flow_model_issues(model: &ModelCard, target_grid: usize) -> Vec<
             model.grid, target_grid
         ));
     }
-    if model.in_channels != 4 || model.out_channels != 3 {
+    if !matches!(
+        (model.in_channels, model.out_channels),
+        (4, 3) | (5, 3)
+    ) {
         issues.push(format!(
-            "channels are {}→{}, not the required 4→3 contract",
+            "channels are {}→{}, not a 4→3 or 5→3 3D obstacle contract",
             model.in_channels, model.out_channels
         ));
     }
@@ -2891,6 +2914,64 @@ assert loaded.authenticity["status"] == "development_unsigned_override"
         ] {
             assert!(!is_qualified_external_flow_model(&mismatch, 64));
         }
+    }
+
+    #[test]
+    fn verified_research_32_five_channel_operator_can_bind_cad() {
+        let research = ModelCard {
+            id: "reyn_models/reyn-flow3d-obstacle-32-v1.reynmodel".into(),
+            name: "Research 32".into(),
+            managed: true,
+            size_bytes: 1,
+            modified_unix: 1,
+            checkpoint_sha256: "a".repeat(64),
+            status: "clean".into(),
+            status_detail: String::new(),
+            dimension: 3,
+            grid: 32,
+            in_channels: 5,
+            out_channels: 3,
+            max_steps: 128,
+            epoch: 40,
+            declared_epochs: 40,
+            checkpoint_role: "fixed_final".into(),
+            scenario: "obstacle".into(),
+            source_digest: Some("source".into()),
+            physics_contract: EXTERNAL_FLOW_MODEL_PHYSICS_CONTRACT.into(),
+            authenticity_status: "verified".into(),
+            publisher_key_id: Some("release".into()),
+            publisher_key_sha256: Some("b".repeat(64)),
+            release_sequence: Some(1),
+            support: Vec::new(),
+            limitations: vec!["Research 3D obstacle operator. Not production-qualified CFD.".into()],
+            benchmark_report_hashes: Vec::new(),
+            unknown_fields: Vec::new(),
+            qualification_class: MODEL_QUALIFICATION_RESEARCH.into(),
+        };
+        assert!(is_qualified_external_flow_model(&research, 32));
+        let mut preview = research.clone();
+        preview.qualification_class = MODEL_QUALIFICATION_PREVIEW.into();
+        assert!(!is_qualified_external_flow_model(&preview, 32));
+        let mut wrong_grid = research.clone();
+        assert!(!is_qualified_external_flow_model(&wrong_grid, 64));
+        wrong_grid.grid = 64;
+        assert!(!is_qualified_external_flow_model(&wrong_grid, 64));
+    }
+
+    #[test]
+    fn research_version_stays_research_even_with_not_production_qualified_copy() {
+        assert_eq!(
+            derive_model_qualification_class(
+                "1.0.0-research",
+                &["Research 3D obstacle operator. Not production-qualified CFD.".into()],
+                "clean"
+            ),
+            MODEL_QUALIFICATION_RESEARCH
+        );
+        assert_eq!(
+            derive_model_qualification_class("1.0.0-yc-preview", &[], "clean"),
+            MODEL_QUALIFICATION_PREVIEW
+        );
     }
 
     #[test]

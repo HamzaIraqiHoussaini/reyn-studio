@@ -26,9 +26,12 @@ RESEARCH_RESOURCES = (
     "flow_contract.py",
     "flow_quantities.py",
     "models_3d.py",
+    "occupancy_geometry_3d.py",
     "obstacle_dataset.py",
     "obstacle_solver.py",
     "obstacle_solver_3d.py",
+    "pressure_channel_contract_3d.py",
+    "pressure_model_contract_3d.py",
     "spectral_solver.py",
     "spectral_solver_3d.py",
     "time_moe_operator.py",
@@ -47,6 +50,13 @@ PREVIEW_MODEL_EVIDENCE = (
     "h64_v3_tail_brinkman_factorial_summary.json",
     "h64_v3_tail_brinkman_combined_replication_summary.json",
 )
+FLOW3D_RESEARCH_MODEL_ROOT = Path("packaging/models/flow3d-obstacle-32")
+FLOW3D_RESEARCH_MODEL_NAME = "reyn-flow3d-obstacle-32-v1.reynmodel"
+FLOW3D_RESEARCH_MODEL_FILES = (
+    FLOW3D_RESEARCH_MODEL_NAME,
+    f"{FLOW3D_RESEARCH_MODEL_NAME}.sig",
+)
+FLOW3D_RESEARCH_MODEL_MANIFEST = "flow3d-obstacle-32-model-release-manifest.json"
 WINDOWS_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 
 
@@ -215,6 +225,20 @@ def copy_resources(root: Path, research_source: Path, stage: Path) -> None:
             root,
             resources / "docs/models" / name,
         )
+    flow3d_source = root / FLOW3D_RESEARCH_MODEL_ROOT
+    for name in FLOW3D_RESEARCH_MODEL_FILES:
+        destination = resources / "research" / name
+        safe_copy_file(flow3d_source / name, root, destination)
+        destination.chmod(destination.stat().st_mode | 0o644)
+    safe_copy_tree(
+        flow3d_source / f"{FLOW3D_RESEARCH_MODEL_NAME}.tuf",
+        resources / "research" / f"{FLOW3D_RESEARCH_MODEL_NAME}.tuf",
+    )
+    safe_copy_file(
+        flow3d_source / "model-release-manifest.json",
+        root,
+        resources / "docs/models" / FLOW3D_RESEARCH_MODEL_MANIFEST,
+    )
 
 
 def inventory(

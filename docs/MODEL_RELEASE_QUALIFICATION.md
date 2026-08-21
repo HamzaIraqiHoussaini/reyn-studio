@@ -3,7 +3,7 @@
 **Assessment date:** 2026-08-07  
 **Decision:** **BLOCKED — no production-qualified external-CAD model**  
 **Intended product lane:** Reyn Studio external-CAD execution  
-**Required model lane:** geometry-conditioned 3D obstacle flow (`fixed_body_brinkman.v1`, 4→3, grid-matched)  
+**Required model lane:** geometry-conditioned 3D obstacle flow (`fixed_body_brinkman.v1`, 4→3 or 5→3, grid-matched)  
 **Bundled preview:** `packaging/models/yc-preview-h64/` exists and is authenticated, but it is a **2D H128 YC research preview**, not a production external-CAD qualifier
 
 ## Executive decision
@@ -23,6 +23,14 @@ Therefore:
 1. The preview pack may ship for authenticity / library / packaging smoke.
 2. It must not be presented as the Studio external-CAD production model.
 3. The first production model still requires the four gates below for one immutable 3D artifact.
+
+### Public 3D evidence vs CAD Run (2026-08-21)
+
+Research 3D evidence is the 32³ one-jump obstacle operator (RelL2 0.052 at 128
+steps, 48 held-out cases). CAD Run voxels the case to that declared grid
+(32,768 cells). A signed, TUF-verified 32³ 5→3 research bundle can bind CAD.
+That is not production-qualified CFD. The 32³ operator is not a file-swap onto
+a 64³ field.
 
 ## Production gates (unchanged bar)
 
