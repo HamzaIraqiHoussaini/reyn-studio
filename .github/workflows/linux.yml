@@ -1,0 +1,17 @@
+# Registers the Linux workflow name on the default branch so
+# `workflow_dispatch` can run the real job from a release branch.
+name: Linux
+
+on:
+  workflow_dispatch:
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Dispatch from a packaging branch
+        run: |
+          echo "This default-branch stub only registers the Linux workflow."
+          echo "Dispatch it with --ref pointing at a branch that contains the packaging job."
+          exit 1
