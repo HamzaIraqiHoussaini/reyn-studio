@@ -138,8 +138,10 @@ python3 scripts/package_linux.py \
   --research-revision "$RESEARCH_REVISION" \
   --runtime-smoke
 
-stage=$(find dist/linux -maxdepth 1 -type d -name 'Reyn-Studio-*-linux-x86_64' | head -n 1)
-test -n "$stage"
+version=$(python3 -c 'import pathlib; t=pathlib.Path("Cargo.toml").read_text();
+print(next(line.split("\"")[1] for line in t.splitlines() if line.startswith("version = ")))')
+stage="dist/linux/Reyn-Studio-${version}-linux-x86_64"
+test -d "$stage"
 python3 scripts/validate_linux_package.py "$stage" --runtime-smoke
 python3 scripts/linux_engine_smoke.py "$stage"
 
